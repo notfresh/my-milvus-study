@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "folly/CancellationToken.h"
 #include "common/EasyAssert.h"
 #include "filemanager/InputStream.h"
 #include "nlohmann/json.hpp"
@@ -48,7 +49,9 @@ class IndexEntryReader {
     Open(std::shared_ptr<milvus::InputStream> input,
          int64_t file_size,
          int64_t collection_id = 0,
-         ThreadPoolPriority priority = ThreadPoolPriority::HIGH);
+         ThreadPoolPriority priority = ThreadPoolPriority::HIGH,
+         folly::CancellationToken cancellation_token =
+             folly::CancellationToken());
 
     std::vector<std::string>
     GetEntryNames() const;
@@ -150,6 +153,8 @@ class IndexEntryReader {
     ReadFooterAndDirectory();
     void
     ValidateMagic();
+    void
+    CheckCancelled(const std::string& operation) const;
 
     Entry
     ReadPlainEntry(const EntryMeta& meta);
@@ -206,6 +211,12 @@ class IndexEntryReader {
                              EntryDownloadState& state,
                              std::vector<std::future<void>>& futures);
 
+    static size_t
+    DownloadRangeCount(uint64_t size);
+
+    static size_t
+    DownloadTaskCount(const EntryMeta& meta);
+
     // Verify CRC and close file descriptor
     void
     FinalizeEntryDownload(EntryDownloadState& state);
@@ -221,6 +232,9 @@ class IndexEntryReader {
                                    EntryStreamDownloadState& state,
                                    std::vector<std::future<void>>& futures);
 
+    static size_t
+    StreamDownloadTaskCount(const EntryMeta& meta);
+
     void
     FinalizeEntryStreamDownload(EntryStreamDownloadState& state);
 
@@ -228,6 +242,7 @@ class IndexEntryReader {
     int64_t file_size_ = 0;
     int64_t collection_id_ = 0;
     ThreadPoolPriority priority_ = ThreadPoolPriority::HIGH;
+    folly::CancellationToken cancellation_token_;
 
     bool is_encrypted_ = false;
     std::string edek_;

@@ -26,7 +26,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
@@ -36,6 +35,7 @@ import (
 	kvdatacoord "github.com/milvus-io/milvus/internal/metastore/kv/datacoord"
 	catalogmocks "github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/taskcommon"
@@ -329,9 +329,9 @@ func (s *CopySegmentTaskSuite) TestWrapCopySegmentTaskLog() {
 	s.True(fieldNames["state"])
 
 	// Test with extra fields
-	extraFields := []zap.Field{
-		zap.String("extra", "value"),
-		zap.Int64("number", 123),
+	extraFields := []mlog.Field{
+		mlog.String("extra", "value"),
+		mlog.Int64("number", 123),
 	}
 	fieldsWithExtra := WrapCopySegmentTaskLog(task, extraFields...)
 	s.Len(fieldsWithExtra, 6)
@@ -469,15 +469,14 @@ func (s *CopySegmentTaskSuite) TestTaskType() {
 }
 
 func (s *CopySegmentTaskSuite) TestQueryTaskOnWorker_NotCompletedKeepsTaskInProgress() {
-	cluster := &struct{ session.Cluster }{}
-	mockQuery := mockey.Mock((*struct{ session.Cluster }).QueryCopySegment).Return(
+	cluster := session.NewMockCluster(s.T())
+	cluster.EXPECT().QueryCopySegment(mock.Anything, mock.Anything).Return(
 		&datapb.QueryCopySegmentResponse{
 			TaskID: 1001,
 			State:  datapb.CopySegmentTaskState_CopySegmentTaskInProgress,
 		},
 		nil,
-	).Build()
-	defer mockQuery.UnPatch()
+	)
 
 	task := &copySegmentTask{
 		tr:    timerecord.NewTimeRecorder("test"),
@@ -497,12 +496,11 @@ func (s *CopySegmentTaskSuite) TestQueryTaskOnWorker_NotCompletedKeepsTaskInProg
 }
 
 func (s *CopySegmentTaskSuite) TestQueryTaskOnWorker_MarksFailedOnRPCError() {
-	cluster := &struct{ session.Cluster }{}
-	mockQuery := mockey.Mock((*struct{ session.Cluster }).QueryCopySegment).Return(
+	cluster := session.NewMockCluster(s.T())
+	cluster.EXPECT().QueryCopySegment(mock.Anything, mock.Anything).Return(
 		nil,
 		errors.New("rpc failed"),
-	).Build()
-	defer mockQuery.UnPatch()
+	)
 
 	task := createTestCopyTask(100, 2001).(*copySegmentTask)
 	copyMeta, _ := newCopySegmentTaskTestMeta(s.T(), task)
@@ -515,16 +513,15 @@ func (s *CopySegmentTaskSuite) TestQueryTaskOnWorker_MarksFailedOnRPCError() {
 }
 
 func (s *CopySegmentTaskSuite) TestQueryTaskOnWorker_MarksFailedOnWorkerFailure() {
-	cluster := &struct{ session.Cluster }{}
-	mockQuery := mockey.Mock((*struct{ session.Cluster }).QueryCopySegment).Return(
+	cluster := session.NewMockCluster(s.T())
+	cluster.EXPECT().QueryCopySegment(mock.Anything, mock.Anything).Return(
 		&datapb.QueryCopySegmentResponse{
 			TaskID: 1001,
 			State:  datapb.CopySegmentTaskState_CopySegmentTaskFailed,
 			Reason: "worker failed",
 		},
 		nil,
-	).Build()
-	defer mockQuery.UnPatch()
+	)
 
 	task := createTestCopyTask(100, 2001).(*copySegmentTask)
 	copyMeta, _ := newCopySegmentTaskTestMeta(s.T(), task)
@@ -537,8 +534,8 @@ func (s *CopySegmentTaskSuite) TestQueryTaskOnWorker_MarksFailedOnWorkerFailure(
 }
 
 func (s *CopySegmentTaskSuite) TestQueryTaskOnWorker_CompletedSyncsTask() {
-	cluster := &struct{ session.Cluster }{}
-	mockQuery := mockey.Mock((*struct{ session.Cluster }).QueryCopySegment).Return(
+	cluster := session.NewMockCluster(s.T())
+	cluster.EXPECT().QueryCopySegment(mock.Anything, mock.Anything).Return(
 		&datapb.QueryCopySegmentResponse{
 			TaskID: 1001,
 			State:  datapb.CopySegmentTaskState_CopySegmentTaskCompleted,
@@ -552,8 +549,7 @@ func (s *CopySegmentTaskSuite) TestQueryTaskOnWorker_CompletedSyncsTask() {
 			},
 		},
 		nil,
-	).Build()
-	defer mockQuery.UnPatch()
+	)
 
 	task := createTestCopyTask(100, 2001).(*copySegmentTask)
 	copyMeta, m := newCopySegmentTaskTestMeta(s.T(), task)

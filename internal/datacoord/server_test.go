@@ -34,7 +34,6 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
@@ -56,7 +55,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
@@ -1009,9 +1008,9 @@ func TestServer_GetMetrics(t *testing.T) {
 	resp, err = svr.GetMetrics(svr.ctx, req)
 	assert.NoError(t, err)
 	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
-	log.Info("TestServer_GetMetrics",
-		zap.String("name", resp.ComponentName),
-		zap.String("response", resp.Response))
+	mlog.Info(context.TODO(), "TestServer_GetMetrics",
+		mlog.String("name", resp.ComponentName),
+		mlog.String("response", resp.Response))
 }
 
 func TestServer_getSystemInfoMetrics(t *testing.T) {
@@ -2603,7 +2602,7 @@ func Test_CheckHealth(t *testing.T) {
 			channelCPs: &channelCPs{
 				checkpoints: map[string]*msgpb.MsgPosition{
 					"cluster-id-rootcoord-dm_3_449684528748778322v0": {
-						Timestamp: tsoutil.ComposeTSByTime(time.Now().Add(-1000*time.Hour), 0),
+						Timestamp: tsoutil.ComposeTSByTime(time.Now().Add(-1000 * time.Hour)),
 						MsgID:     []byte{1, 2, 3, 4},
 					},
 				},
@@ -2625,15 +2624,15 @@ func Test_CheckHealth(t *testing.T) {
 			channelCPs: &channelCPs{
 				checkpoints: map[string]*msgpb.MsgPosition{
 					"cluster-id-rootcoord-dm_3_449684528748778322v0": {
-						Timestamp: tsoutil.ComposeTSByTime(time.Now(), 0),
+						Timestamp: tsoutil.ComposeTSByTime(time.Now()),
 						MsgID:     []byte{1, 2, 3, 4},
 					},
 					"cluster-id-rootcoord-dm_3_449684528748778323v0": {
-						Timestamp: tsoutil.ComposeTSByTime(time.Now(), 0),
+						Timestamp: tsoutil.ComposeTSByTime(time.Now()),
 						MsgID:     []byte{1, 2, 3, 4},
 					},
 					"invalid-vchannel-name": {
-						Timestamp: tsoutil.ComposeTSByTime(time.Now(), 0),
+						Timestamp: tsoutil.ComposeTSByTime(time.Now()),
 						MsgID:     []byte{1, 2, 3, 4},
 					},
 				},

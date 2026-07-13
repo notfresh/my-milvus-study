@@ -18,9 +18,7 @@ package rootcoord
 
 import (
 	"context"
-	"fmt"
 
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
@@ -28,7 +26,7 @@ import (
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -87,7 +85,7 @@ func callAlterCollection(ctx context.Context, c *Core, broadcaster broadcaster.B
 
 func alterFunctionGenNewCollection(ctx context.Context, fSchema *schemapb.FunctionSchema, collection *model.Collection) error {
 	if fSchema == nil {
-		return fmt.Errorf("function schema is empty")
+		return merr.WrapErrParameterInvalidMsg("function schema is empty")
 	}
 	var oldFuncSchema *model.Function
 	newFuncs := []*model.Function{}
@@ -99,8 +97,8 @@ func alterFunctionGenNewCollection(ctx context.Context, fSchema *schemapb.Functi
 		}
 	}
 	if oldFuncSchema == nil {
-		err := fmt.Errorf("function %s not exists", fSchema.Name)
-		log.Ctx(ctx).Error("Alter function failed:", zap.Error(err))
+		err := merr.WrapErrParameterInvalidMsg("function %s not exists", fSchema.Name)
+		mlog.Error(ctx, "Alter function failed:", mlog.Err(err))
 		return err
 	}
 
@@ -115,7 +113,7 @@ func alterFunctionGenNewCollection(ctx context.Context, fSchema *schemapb.Functi
 	for _, name := range oldFuncSchema.OutputFieldNames {
 		field, exists := fieldMapping[name]
 		if !exists {
-			return fmt.Errorf("old version function's output field %s not exists", name)
+			return merr.WrapErrParameterInvalidMsg("old version function's output field %s not exists", name)
 		}
 		field.IsFunctionOutput = false
 	}
@@ -123,8 +121,8 @@ func alterFunctionGenNewCollection(ctx context.Context, fSchema *schemapb.Functi
 	for _, name := range fSchema.InputFieldNames {
 		field, exists := fieldMapping[name]
 		if !exists {
-			err := fmt.Errorf("function's input field %s not exists", name)
-			log.Ctx(ctx).Error("Incorrect function configuration:", zap.Error(err))
+			err := merr.WrapErrParameterInvalidMsg("function's input field %s not exists", name)
+			mlog.Error(ctx, "Incorrect function configuration:", mlog.Err(err))
 			return err
 		}
 		fSchema.InputFieldIds = append(fSchema.InputFieldIds, field.FieldID)
@@ -132,13 +130,13 @@ func alterFunctionGenNewCollection(ctx context.Context, fSchema *schemapb.Functi
 	for _, name := range fSchema.OutputFieldNames {
 		field, exists := fieldMapping[name]
 		if !exists {
-			err := fmt.Errorf("function's output field %s not exists", name)
-			log.Ctx(ctx).Error("Incorrect function configuration:", zap.Error(err))
+			err := merr.WrapErrParameterInvalidMsg("function's output field %s not exists", name)
+			mlog.Error(ctx, "Incorrect function configuration:", mlog.Err(err))
 			return err
 		}
 		if field.IsFunctionOutput {
-			err := fmt.Errorf("function's output field %s is already of other functions", name)
-			log.Ctx(ctx).Error("Incorrect function configuration: ", zap.Error(err))
+			err := merr.WrapErrParameterInvalidMsg("function's output field %s is already of other functions", name)
+			mlog.Error(ctx, "Incorrect function configuration: ", mlog.Err(err))
 			return err
 		}
 		fSchema.OutputFieldIds = append(fSchema.OutputFieldIds, field.FieldID)
@@ -216,7 +214,7 @@ func (c *Core) broadcastAlterCollectionForDropFunction(ctx context.Context, req 
 	for _, id := range needDelFunc.OutputFieldIDs {
 		field, exists := fieldMapping[id]
 		if !exists {
-			return fmt.Errorf("function's output field %d not exists", id)
+			return merr.WrapErrServiceInternalMsg("function's output field %d not exists", id)
 		}
 		field.IsFunctionOutput = false
 	}
@@ -238,7 +236,7 @@ func (c *Core) broadcastAlterCollectionForAddFunction(ctx context.Context, req *
 	newColl := oldColl.Clone()
 	fSchema := req.FunctionSchema
 	if fSchema == nil {
-		return merr.WrapErrParameterInvalidMsg("Function schema is empty")
+		return merr.WrapErrParameterInvalidMsg("function schema is empty")
 	}
 
 	nextFunctionID := int64(StartOfUserFunctionID)
@@ -257,8 +255,8 @@ func (c *Core) broadcastAlterCollectionForAddFunction(ctx context.Context, req *
 	for _, name := range fSchema.InputFieldNames {
 		field, exists := fieldMapping[name]
 		if !exists {
-			err := fmt.Errorf("function's input field %s not exists", name)
-			log.Ctx(ctx).Error("Incorrect function configuration:", zap.Error(err))
+			err := merr.WrapErrParameterInvalidMsg("function's input field %s not exists", name)
+			mlog.Error(ctx, "Incorrect function configuration:", mlog.Err(err))
 			return err
 		}
 		fSchema.InputFieldIds = append(fSchema.InputFieldIds, field.FieldID)
@@ -266,13 +264,13 @@ func (c *Core) broadcastAlterCollectionForAddFunction(ctx context.Context, req *
 	for _, name := range fSchema.OutputFieldNames {
 		field, exists := fieldMapping[name]
 		if !exists {
-			err := fmt.Errorf("function's output field %s not exists", name)
-			log.Ctx(ctx).Error("Incorrect function configuration:", zap.Error(err))
+			err := merr.WrapErrParameterInvalidMsg("function's output field %s not exists", name)
+			mlog.Error(ctx, "Incorrect function configuration:", mlog.Err(err))
 			return err
 		}
 		if field.IsFunctionOutput {
-			err := fmt.Errorf("function's output field %s is already of other functions", name)
-			log.Ctx(ctx).Error("Incorrect function configuration: ", zap.Error(err))
+			err := merr.WrapErrParameterInvalidMsg("function's output field %s is already of other functions", name)
+			mlog.Error(ctx, "Incorrect function configuration: ", mlog.Err(err))
 			return err
 		}
 		fSchema.OutputFieldIds = append(fSchema.OutputFieldIds, field.FieldID)

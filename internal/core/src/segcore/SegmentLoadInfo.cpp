@@ -55,6 +55,26 @@ SegmentLoadInfo::GetColumnGroups() const {
     return column_groups_;
 }
 
+// Looks up a storage column in the cached manifest column groups only.
+bool
+SegmentLoadInfo::HasManifestColumn(const std::string& column_name) const {
+    auto column_groups = column_groups_;
+    if (column_groups == nullptr) {
+        return false;
+    }
+    for (const auto& group : *column_groups) {
+        if (group == nullptr) {
+            continue;
+        }
+        for (const auto& column : group->columns) {
+            if (column == column_name) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 LoadIndexInfo
 SegmentLoadInfo::ConvertFieldIndexInfoToLoadIndexInfo(
     const proto::segcore::FieldIndexInfo* field_index_info,
@@ -67,6 +87,7 @@ SegmentLoadInfo::ConvertFieldIndexInfoToLoadIndexInfo(
     load_index_info.field_id = field_id.get();
     load_index_info.collection_id = GetCollectionID();
     load_index_info.partition_id = GetPartitionID();
+    load_index_info.shard = GetInsertChannel();
 
     // Get field type from schema
     const auto& field_meta = schema_->operator[](field_id);
@@ -77,6 +98,8 @@ SegmentLoadInfo::ConvertFieldIndexInfoToLoadIndexInfo(
     load_index_info.index_id = field_index_info->indexid();
     load_index_info.index_build_id = field_index_info->buildid();
     load_index_info.index_version = field_index_info->index_version();
+    load_index_info.index_store_path_version =
+        field_index_info->index_store_path_version();
     load_index_info.index_engine_version =
         static_cast<IndexVersion>(field_index_info->current_index_version());
     load_index_info.index_size = field_index_info->index_size();
@@ -141,17 +164,24 @@ SegmentLoadInfo::ConvertFieldIndexInfoToLoadIndexInfo(
 
 bool
 SegmentLoadInfo::CheckIndexHasRawData(const LoadIndexInfo& load_index_info) {
-    auto request = milvus::index::IndexFactory::GetInstance().IndexLoadResource(
-        load_index_info.field_type,
-        load_index_info.element_type,
-        load_index_info.index_engine_version,
-        load_index_info.index_size,
-        load_index_info.index_params,
-        load_index_info.enable_mmap,
-        load_index_info.num_rows,
-        load_index_info.dim);
-
-    return request.has_raw_data;
+    if (load_index_info.load_resource_request.has_value()) {
+        return milvus::index::IndexFactory::CanUseIndexRawDataForField(
+            load_index_info.field_type,
+            load_index_info.load_resource_request->has_raw_data);
+    } else {
+        auto request =
+            milvus::index::IndexFactory::GetInstance().IndexLoadResource(
+                load_index_info.field_type,
+                load_index_info.element_type,
+                load_index_info.index_engine_version,
+                load_index_info.index_size,
+                load_index_info.index_params,
+                load_index_info.enable_mmap,
+                load_index_info.num_rows,
+                load_index_info.dim);
+        return milvus::index::IndexFactory::CanUseIndexRawDataForField(
+            load_index_info.field_type, request.has_raw_data);
+    }
 }
 
 std::shared_ptr<proto::indexcgo::LoadTextIndexInfo>

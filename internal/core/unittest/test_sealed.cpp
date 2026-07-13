@@ -18,14 +18,17 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -91,6 +94,111 @@ using namespace milvus::query;
 using namespace milvus::segcore;
 
 using milvus::segcore::LoadIndexInfo;
+
+namespace {
+
+bool
+GetFieldBit(const BitsetType& bitset, FieldId field_id) {
+    auto pos = field_id.get() - START_USER_FIELDID;
+    AssertInfo(pos >= 0, "invalid field id");
+    return bitset[pos];
+}
+
+class CancellationObservingIndexTranslator
+    : public cachinglayer::Translator<index::IndexBase> {
+ public:
+    CancellationObservingIndexTranslator(
+        std::string key,
+        std::unique_ptr<index::IndexBase> index,
+        folly::CancellationToken* observed_token,
+        std::promise<void>* warmup_started)
+        : key_(std::move(key)),
+          index_(std::move(index)),
+          observed_token_(observed_token),
+          warmup_started_(warmup_started),
+          meta_(cachinglayer::StorageType::MEMORY,
+                cachinglayer::CellIdMappingMode::IDENTICAL,
+                cachinglayer::CellDataType::OTHER,
+                CacheWarmupPolicy::CacheWarmupPolicy_Async,
+                false) {
+    }
+
+    size_t
+    num_cells() const override {
+        return 1;
+    }
+
+    cachinglayer::cid_t
+    cell_id_of(cachinglayer::uid_t uid) const override {
+        return uid;
+    }
+
+    std::pair<cachinglayer::ResourceUsage, cachinglayer::ResourceUsage>
+    estimated_byte_size_of_cell(cachinglayer::cid_t) const override {
+        return {{0, 0}, {0, 0}};
+    }
+
+    int64_t
+    cells_storage_bytes(
+        const std::vector<cachinglayer::cid_t>&) const override {
+        return 0;
+    }
+
+    const std::string&
+    key() const override {
+        return key_;
+    }
+
+    cachinglayer::Meta*
+    meta() override {
+        return &meta_;
+    }
+
+    std::vector<
+        std::pair<cachinglayer::cid_t, std::unique_ptr<index::IndexBase>>>
+    get_cells(milvus::OpContext* ctx,
+              const std::vector<cachinglayer::cid_t>& cids) override {
+        AssertInfo(ctx != nullptr, "warmup context must not be null");
+        *observed_token_ = ctx->cancellation_token;
+        warmup_started_->set_value();
+        std::vector<
+            std::pair<cachinglayer::cid_t, std::unique_ptr<index::IndexBase>>>
+            result;
+        result.reserve(cids.size());
+        for (auto cid : cids) {
+            AssertInfo(cid == 0, "test index translator has one cell");
+            result.emplace_back(cid, std::move(index_));
+        }
+        return result;
+    }
+
+ private:
+    std::string key_;
+    std::unique_ptr<index::IndexBase> index_;
+    folly::CancellationToken* observed_token_;
+    std::promise<void>* warmup_started_;
+    cachinglayer::Meta meta_;
+};
+
+index::CacheIndexBasePtr
+CreateCancellationObservingCacheIndex(std::string key,
+                                      std::unique_ptr<index::IndexBase> index,
+                                      folly::CancellationToken* observed_token,
+                                      std::promise<void>* warmup_started,
+                                      cachinglayer::internal::DList* dlist) {
+    auto translator = std::make_unique<CancellationObservingIndexTranslator>(
+        std::move(key), std::move(index), observed_token, warmup_started);
+    return std::make_shared<cachinglayer::CacheSlot<index::IndexBase>>(
+        std::move(translator),
+        dlist,
+        false,
+        false,
+        true,
+        std::chrono::seconds(5),
+        std::chrono::seconds(5));
+}
+
+}  // namespace
 
 const int64_t ROW_COUNT = 2 * 1000;
 const int64_t BIAS = 1000;
@@ -1623,6 +1731,43 @@ TEST(Sealed, LoadArrayFieldData) {
         s->bulk_subscript(nullptr, array_id, ids_ds->GetIds(), N);
     auto result_count = int64_result->scalars().array_data().data().size();
     ASSERT_EQ(result_count, N);
+}
+
+TEST(Sealed, LoadArrayFieldDataWhenIndexHasRawData) {
+    auto dim = 4;
+    auto N = 10;
+    auto metric_type = knowhere::metric::L2;
+    auto schema = std::make_shared<Schema>();
+    schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, dim, metric_type);
+    auto counter_id = schema->AddDebugField("counter", DataType::INT64);
+    auto array_id =
+        schema->AddDebugField("array", DataType::ARRAY, DataType::INT64);
+    schema->set_primary_field_id(counter_id);
+
+    auto dataset = DataGen(schema, N);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+
+    auto counter_data = dataset.get_col<int64_t>(counter_id);
+    auto indexing = GenScalarIndexing<int64_t>(N, counter_data.data());
+
+    LoadIndexInfo array_index;
+    array_index.field_id = array_id.get();
+    array_index.field_type = DataType::ARRAY;
+    array_index.element_type = DataType::INT64;
+    array_index.index_params = GenIndexParams(indexing.get());
+    LoadResourceRequest request{};
+    request.has_raw_data = true;
+    array_index.load_resource_request = request;
+    array_index.cache_index =
+        CreateTestCacheIndex("array_raw_index", std::move(indexing));
+    segment->LoadIndex(array_index);
+
+    auto ids_ds = GenRandomIds(N);
+    auto s = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    auto array_result =
+        s->bulk_subscript(nullptr, array_id, ids_ds->GetIds(), N);
+    ASSERT_EQ(array_result->type(), proto::schema::DataType::Array);
+    ASSERT_EQ(array_result->scalars().array_data().data_size(), N);
 }
 
 TEST(Sealed, LoadArrayFieldDataWithMMap) {
@@ -3616,7 +3761,7 @@ TEST(SealedSegmentReopen, SchemaOnlyReopenPublishesDefaultFilledState) {
     EXPECT_NO_THROW(sealed->Reopen(new_schema));
     EXPECT_TRUE(sealed->HasFieldData(FieldId(101)));
 
-    auto snapshot = sealed->TestGetSegmentLoadInfo();
+    auto snapshot = sealed->TestGetLoadInfoSnapshot();
     EXPECT_TRUE(snapshot->IsFieldFilledWithDefault(FieldId(101)));
 }
 
@@ -3643,16 +3788,108 @@ TEST(SealedSegmentReopen, SchemaAwareReopenDiscardsOlderSchema) {
     ASSERT_NE(sealed, nullptr);
 
     EXPECT_NO_THROW(sealed->Reopen(new_schema));
-    ASSERT_TRUE(sealed->TestGetSegmentLoadInfo()->HasFieldInSchema(new_field));
+    ASSERT_TRUE(sealed->TestGetLoadInfoSnapshot()->HasFieldInSchema(new_field));
 
     proto::segcore::SegmentLoadInfo stale_proto =
         sealed->TestGetSegmentLoadInfo()->GetProto();
     milvus::OpContext op_ctx;
     EXPECT_NO_THROW(sealed->Reopen(&op_ctx, stale_proto, stale_schema));
 
-    auto snapshot = sealed->TestGetSegmentLoadInfo();
+    auto snapshot = sealed->TestGetLoadInfoSnapshot();
     EXPECT_TRUE(snapshot->HasFieldInSchema(new_field));
     EXPECT_TRUE(sealed->HasFieldData(new_field));
+}
+
+TEST(SealedSegmentReopen, DropFieldReopenPublishesSchemaAndLoadInfoTogether) {
+    auto old_schema = std::make_shared<Schema>();
+    auto pk_id = old_schema->AddDebugField("pk", DataType::INT64);
+    auto dropped_id = old_schema->AddDebugField("dropped", DataType::INT64);
+    old_schema->set_primary_field_id(pk_id);
+    old_schema->set_schema_version(100);
+
+    auto dataset = DataGen(old_schema, 4);
+    auto segment = CreateSealedWithFieldDataLoaded(old_schema, dataset);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    ASSERT_TRUE(sealed->FieldAccessible(dropped_id));
+    ASSERT_TRUE(
+        sealed->TestGetLoadInfoSnapshot()->HasFieldInSchema(dropped_id));
+
+    auto new_schema = std::make_shared<Schema>();
+    auto new_pk_id = new_schema->AddDebugField("pk", DataType::INT64);
+    new_schema->set_primary_field_id(new_pk_id);
+    new_schema->set_schema_version(200);
+
+    EXPECT_NO_THROW(sealed->Reopen(new_schema));
+
+    auto schema_snapshot = sealed->TestGetSchemaSnapshot();
+    auto load_info_snapshot = sealed->TestGetLoadInfoSnapshot();
+    EXPECT_EQ(schema_snapshot->get_schema_version(), 200);
+    EXPECT_EQ(schema_snapshot->get_fields().count(dropped_id), 0);
+    EXPECT_FALSE(load_info_snapshot->HasFieldInSchema(dropped_id));
+    EXPECT_FALSE(sealed->HasFieldData(dropped_id));
+    EXPECT_FALSE(sealed->HasIndex(dropped_id));
+    EXPECT_FALSE(sealed->FieldAccessible(dropped_id));
+}
+
+TEST(SealedSegmentReopen, TextIndexCancellationGuardDoesNotLeakPendingState) {
+    std::map<std::string, std::string> analyzer_params;
+    auto schema = std::make_shared<Schema>();
+    auto pk_id = schema->AddDebugField("pk", DataType::INT64);
+    auto text_fid = schema->AddDebugVarcharField(FieldName("text_field"),
+                                                 DataType::VARCHAR,
+                                                 /*max_length=*/65535,
+                                                 /*nullable=*/false,
+                                                 /*enable_match=*/true,
+                                                 /*enable_analyzer=*/true,
+                                                 analyzer_params,
+                                                 std::nullopt);
+    schema->set_primary_field_id(pk_id);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    EXPECT_FALSE(sealed->TestHasPendingTextIndex(text_fid));
+    EXPECT_FALSE(
+        sealed->TestGetLoadInfoSnapshot()->HasTextIndexCreated(text_fid));
+
+    sealed->TestRegisterPendingTextIndex(text_fid);
+
+    EXPECT_FALSE(sealed->TestHasPendingTextIndex(text_fid));
+    EXPECT_FALSE(
+        sealed->TestGetLoadInfoSnapshot()->HasTextIndexCreated(text_fid));
+}
+
+TEST(SealedSegmentReopen, RuntimeTextIndexMarkerPublishesToLoadInfoSnapshot) {
+    std::map<std::string, std::string> analyzer_params;
+    auto schema = std::make_shared<Schema>();
+    auto pk_id = schema->AddDebugField("pk", DataType::INT64);
+    auto text_fid = schema->AddDebugVarcharField(FieldName("text_field"),
+                                                 DataType::VARCHAR,
+                                                 /*max_length=*/65535,
+                                                 /*nullable=*/false,
+                                                 /*enable_match=*/true,
+                                                 /*enable_analyzer=*/true,
+                                                 analyzer_params,
+                                                 std::nullopt);
+    schema->set_primary_field_id(pk_id);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    proto::segcore::SegmentLoadInfo proto;
+    proto.set_segmentid(60001);
+    proto.set_num_of_rows(0);
+    sealed->SetLoadInfo(proto);
+
+    ASSERT_FALSE(
+        sealed->TestGetLoadInfoSnapshot()->HasTextIndexCreated(text_fid));
+    sealed->TestRecordTextIndexCreated(text_fid);
+    EXPECT_TRUE(
+        sealed->TestGetLoadInfoSnapshot()->HasTextIndexCreated(text_fid));
 }
 
 TEST(SealedSegmentReopen, SchemaOnlyReopenPreservesCreatedTextIndexState) {
@@ -3667,6 +3904,7 @@ TEST(SealedSegmentReopen, SchemaOnlyReopenPreservesCreatedTextIndexState) {
                                                      /*enable_analyzer=*/true,
                                                      analyzer_params,
                                                      std::nullopt);
+    auto new_field = FieldId(text_fid.get() + 1);
     old_schema->set_primary_field_id(pk_id);
     old_schema->set_schema_version(100);
 
@@ -3681,7 +3919,8 @@ TEST(SealedSegmentReopen, SchemaOnlyReopenPreservesCreatedTextIndexState) {
                                          /*enable_analyzer=*/true,
                                          analyzer_params,
                                          std::nullopt);
-    new_schema->AddDebugField("new_field", DataType::INT64);
+    ASSERT_EQ(new_schema->AddDebugField("new_field", DataType::INT64),
+              new_field);
     new_schema->set_primary_field_id(new_pk_id);
     new_schema->set_schema_version(200);
     ASSERT_EQ(text_fid, new_text_fid);
@@ -3693,11 +3932,12 @@ TEST(SealedSegmentReopen, SchemaOnlyReopenPreservesCreatedTextIndexState) {
 
     sealed->TestRecordTextIndexCreated(text_fid);
     ASSERT_TRUE(
-        sealed->TestGetSegmentLoadInfo()->HasTextIndexCreated(text_fid));
+        sealed->TestGetLoadInfoSnapshot()->HasTextIndexCreated(text_fid));
 
     EXPECT_NO_THROW(sealed->Reopen(new_schema));
-    EXPECT_TRUE(
-        sealed->TestGetSegmentLoadInfo()->HasTextIndexCreated(text_fid));
+    auto snapshot = sealed->TestGetLoadInfoSnapshot();
+    EXPECT_TRUE(snapshot->HasTextIndexCreated(text_fid));
+    EXPECT_TRUE(snapshot->HasFieldInSchema(new_field));
 }
 
 // Reproducer for issue #49076.
@@ -3746,7 +3986,7 @@ TEST(SealedSegmentReopen, TextIndexCreatedWipedByReopen) {
     // CreateTextIndex for the enable_match field.
     sealed->TestRecordTextIndexCreated(text_fid);
     ASSERT_TRUE(
-        sealed->TestGetSegmentLoadInfo()->HasTextIndexCreated(text_fid));
+        sealed->TestGetLoadInfoSnapshot()->HasTextIndexCreated(text_fid));
 
     // Reopen must preserve the runtime-only created_text_indexes_. Before
     // the fix this fails (member wiped by `segment_load_info_ =
@@ -3761,5 +4001,855 @@ TEST(SealedSegmentReopen, TextIndexCreatedWipedByReopen) {
     }
 
     EXPECT_TRUE(
-        sealed->TestGetSegmentLoadInfo()->HasTextIndexCreated(text_fid));
+        sealed->TestGetLoadInfoSnapshot()->HasTextIndexCreated(text_fid));
+}
+
+TEST(SealedSegmentCowState, StagedTextIndexIsInvisibleBeforePublish) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    std::map<std::string, std::string> analyzer_params;
+    auto text = schema->AddDebugVarcharField(FieldName("text"),
+                                             DataType::VARCHAR,
+                                             /*max_length=*/65535,
+                                             /*nullable=*/false,
+                                             /*enable_match=*/true,
+                                             /*enable_analyzer=*/true,
+                                             analyzer_params,
+                                             std::nullopt);
+    schema->set_primary_field_id(pk);
+
+    auto dataset = DataGen(schema, 4);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto published_before = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(published_before->runtime->text_indexes.count(text), 0);
+
+    auto staged_runtime = sealed->TestCloneMutableRuntimeResourceState();
+    sealed->TestCreateTextIndexWithSchema(
+        text, schema, nullptr, false, staged_runtime.get());
+
+    EXPECT_EQ(staged_runtime->text_indexes.count(text), 1);
+    EXPECT_EQ(published_before->runtime->text_indexes.count(text), 0);
+    EXPECT_ANY_THROW(sealed->GetTextIndex(nullptr, text));
+    EXPECT_FALSE(sealed->TestGetLoadInfoSnapshot()->HasTextIndexCreated(text));
+}
+
+TEST(SealedSegmentCowState, PublishedTextIndexFollowsSnapshotLifetime) {
+    auto old_schema = std::make_shared<Schema>();
+    auto pk = old_schema->AddDebugField("pk", DataType::INT64);
+    std::map<std::string, std::string> analyzer_params;
+    auto text = old_schema->AddDebugVarcharField(FieldName("text"),
+                                                 DataType::VARCHAR,
+                                                 /*max_length=*/65535,
+                                                 /*nullable=*/false,
+                                                 /*enable_match=*/true,
+                                                 /*enable_analyzer=*/true,
+                                                 analyzer_params,
+                                                 std::nullopt);
+    old_schema->set_primary_field_id(pk);
+    old_schema->set_schema_version(100);
+
+    auto dataset = DataGen(old_schema, 4);
+    auto segment = CreateSealedWithFieldDataLoaded(old_schema, dataset);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto before_create = sealed->TestGetPublishedStateSnapshot();
+    sealed->CreateTextIndex(text);
+    auto published_with_index = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(before_create->runtime->text_indexes.count(text), 0);
+    ASSERT_EQ(published_with_index->runtime->text_indexes.count(text), 1);
+    EXPECT_TRUE(published_with_index->load_info->HasTextIndexCreated(text));
+
+    auto old_pin = sealed->GetTextIndex(nullptr, text);
+    ASSERT_NE(old_pin.get(), nullptr);
+
+    auto new_schema = std::make_shared<Schema>();
+    auto new_pk = new_schema->AddDebugField("pk", DataType::INT64);
+    new_schema->set_primary_field_id(new_pk);
+    new_schema->set_schema_version(200);
+    sealed->Reopen(new_schema);
+
+    auto published_after_drop = sealed->TestGetPublishedStateSnapshot();
+    EXPECT_EQ(published_after_drop->runtime->text_indexes.count(text), 0);
+    EXPECT_ANY_THROW(sealed->GetTextIndex(nullptr, text));
+    EXPECT_NE(old_pin.get(), nullptr);
+    EXPECT_EQ(published_with_index->runtime->text_indexes.count(text), 1);
+}
+
+TEST(SealedSegmentCowState,
+     SystemReadyMustNotBeVisibleBeforeTimestampIsPublished) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->AddDebugField(
+        "vec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    schema->set_primary_field_id(pk);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto before = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_FALSE(before->system_field_ready);
+    ASSERT_TRUE(before->runtime == nullptr ||
+                before->runtime->fields.count(TimestampFieldID) == 0);
+
+    sealed->TestPublishSystemFieldState();
+
+    auto after = sealed->TestGetPublishedStateSnapshot();
+    EXPECT_FALSE(after->system_field_ready)
+        << "system readiness must be derived from published timestamp state";
+    EXPECT_TRUE(after->runtime == nullptr ||
+                after->runtime->fields.count(TimestampFieldID) == 0);
+}
+
+TEST(SealedSegmentCowState, ReopenNextStateMustNotInheritStaleFieldReadyBit) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto payload = schema->AddDebugField("payload", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    schema->set_schema_version(100);
+
+    auto dataset = DataGen(schema, 1);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_TRUE(GetFieldBit(current->field_data_ready_bitset, payload));
+
+    auto next_runtime = sealed->TestCloneMutableRuntimeResourceState();
+    next_runtime->fields.erase(payload);
+    next_runtime->array_offsets_map.erase(payload);
+
+    ChunkedSegmentSealedImpl::StateDelta delta;
+    delta.schema = current->schema;
+    delta.load_info = current->load_info;
+    delta.runtime =
+        sealed->TestFreezeRuntimeResourceState(std::move(next_runtime));
+    delta.commit_ts = current->commit_ts;
+
+    auto next = sealed->TestBuildNextPublishedState(current, delta);
+    EXPECT_FALSE(GetFieldBit(next->field_data_ready_bitset, payload))
+        << "field readiness must be rebuilt from published runtime";
+}
+
+TEST(SealedSegmentCowState, ReopenNextStateMustNotInheritStaleVectorIndexBit) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto vec = schema->AddDebugField(
+        "vec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    schema->set_primary_field_id(pk);
+    schema->set_schema_version(100);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    sealed->TestPublishVectorIndexFacts(vec,
+                                        /*ready=*/true,
+                                        /*binlog_ready=*/false,
+                                        /*has_raw_data=*/false);
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_TRUE(GetFieldBit(current->index_ready_bitset, vec));
+    ASSERT_FALSE(GetFieldBit(current->binlog_index_bitset, vec));
+    ASSERT_TRUE(current->published_index_has_raw_data.count(vec));
+    ASSERT_FALSE(current->published_index_has_raw_data.at(vec));
+
+    ChunkedSegmentSealedImpl::StateDelta delta;
+    delta.schema = current->schema;
+    delta.load_info = current->load_info;
+    delta.runtime = current->runtime;
+    delta.commit_ts = current->commit_ts;
+    delta.published_index_ready_bitset =
+        BitsetType(current->published_index_ready_bitset.size());
+    delta.published_binlog_index_ready_bitset =
+        BitsetType(current->published_binlog_index_ready_bitset.size());
+    delta.published_index_has_raw_data = std::unordered_map<FieldId, bool>{};
+
+    auto next = sealed->TestBuildNextPublishedState(current, delta);
+    EXPECT_FALSE(GetFieldBit(next->index_ready_bitset, vec))
+        << "vector index readiness must be rebuilt from published vector facts";
+    EXPECT_FALSE(GetFieldBit(next->binlog_index_bitset, vec));
+    EXPECT_TRUE(next->index_has_raw_data.find(vec) ==
+                next->index_has_raw_data.end());
+}
+
+TEST(SealedSegmentCowState, DropShrunkHighestFieldStateDoesNotReadPastBitset) {
+    auto old_schema = std::make_shared<Schema>();
+    auto old_pk = old_schema->AddDebugField("pk", DataType::INT64);
+    auto dropped_vec = old_schema->AddDebugField(
+        "vec", DataType::VECTOR_FLOAT, 4, knowhere::metric::L2);
+    old_schema->set_primary_field_id(old_pk);
+    old_schema->set_schema_version(100);
+
+    auto new_schema = std::make_shared<Schema>();
+    auto new_pk = new_schema->AddDebugField("pk", DataType::INT64);
+    new_schema->set_primary_field_id(new_pk);
+    new_schema->set_schema_version(200);
+
+    auto segment = CreateSealedSegment(old_schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    sealed->TestPublishVectorIndexFacts(dropped_vec,
+                                        /*ready=*/true,
+                                        /*binlog_ready=*/false,
+                                        /*has_raw_data=*/true);
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(current->index_ready_bitset.size(), 2);
+    ASSERT_TRUE(current->published_index_has_raw_data.count(dropped_vec));
+
+    ChunkedSegmentSealedImpl::StateDelta delta;
+    delta.schema = new_schema;
+    delta.load_info = std::make_shared<const SegmentLoadInfo>(
+        current->load_info->GetProto(), new_schema);
+    delta.runtime = current->runtime;
+    delta.commit_ts = current->commit_ts;
+
+    auto staged_drop_field =
+        sealed->TestBuildNextPublishedState(current, delta);
+    ASSERT_EQ(staged_drop_field->index_ready_bitset.size(), 1);
+    ASSERT_TRUE(
+        staged_drop_field->published_index_has_raw_data.count(dropped_vec));
+    ASSERT_NO_THROW(
+        sealed->TestDropFieldFromState(*staged_drop_field, dropped_vec));
+    EXPECT_FALSE(
+        staged_drop_field->published_index_has_raw_data.count(dropped_vec));
+    EXPECT_TRUE(staged_drop_field->index_has_raw_data.find(dropped_vec) ==
+                staged_drop_field->index_has_raw_data.end());
+
+    auto staged_drop_index =
+        sealed->TestBuildNextPublishedState(current, delta);
+    ASSERT_EQ(staged_drop_index->index_ready_bitset.size(), 1);
+    ASSERT_TRUE(
+        staged_drop_index->published_index_has_raw_data.count(dropped_vec));
+    ASSERT_NO_THROW(
+        sealed->TestDropIndexFromState(*staged_drop_index, dropped_vec));
+    EXPECT_FALSE(
+        staged_drop_index->published_index_has_raw_data.count(dropped_vec));
+    EXPECT_TRUE(staged_drop_index->index_has_raw_data.find(dropped_vec) ==
+                staged_drop_index->index_has_raw_data.end());
+}
+
+TEST(SealedSegmentCowState, StagedVectorIndexLoadUsesResizedNewSchemaBitset) {
+    auto old_schema = std::make_shared<Schema>();
+    auto old_pk = old_schema->AddDebugField("pk", DataType::INT64);
+    old_schema->set_primary_field_id(old_pk);
+    old_schema->set_schema_version(100);
+
+    auto new_schema = std::make_shared<Schema>();
+    auto new_pk = new_schema->AddDebugField("pk", DataType::INT64);
+    auto new_vec = new_schema->AddDebugField(
+        "vec", DataType::VECTOR_FLOAT, 4, knowhere::metric::L2);
+    new_schema->set_primary_field_id(new_pk);
+    new_schema->set_schema_version(200);
+
+    auto segment = CreateSealedSegment(old_schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(current->index_ready_bitset.size(), 1);
+    ASSERT_FALSE(current->schema->get_fields().count(new_vec));
+
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    auto staged_load_info = std::make_shared<const SegmentLoadInfo>(
+        current->load_info->GetProto(), new_schema);
+    ChunkedSegmentSealedImpl::StateDelta initial_delta;
+    initial_delta.schema = new_schema;
+    initial_delta.load_info = staged_load_info;
+    initial_delta.runtime = sealed->TestFreezeRuntimeResourceState(runtime);
+    initial_delta.commit_ts = current->commit_ts;
+    auto staged = sealed->TestBuildNextPublishedState(current, initial_delta);
+
+    ASSERT_EQ(staged->index_ready_bitset.size(), 2);
+    ASSERT_FALSE(GetFieldBit(staged->index_ready_bitset, new_vec));
+
+    milvus::index::CreateIndexInfo create_index_info;
+    create_index_info.field_type = DataType::VECTOR_FLOAT;
+    create_index_info.metric_type = knowhere::metric::L2;
+    create_index_info.index_type = knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
+    create_index_info.index_engine_version =
+        knowhere::Version::GetCurrentVersion().VersionNumber();
+    auto indexing = milvus::index::IndexFactory::GetInstance().CreateIndex(
+        create_index_info, milvus::storage::FileManagerContext());
+
+    LoadIndexInfo load_info;
+    load_info.field_id = new_vec.get();
+    load_info.index_params = GenIndexParams(indexing.get());
+    load_info.index_params["metric_type"] = knowhere::metric::L2;
+    load_info.cache_index =
+        CreateTestCacheIndex("staged-vector", std::move(indexing));
+    load_info.load_resource_request = LoadResourceRequest{0, 0, 0, 0, true};
+
+    ChunkedSegmentSealedImpl::StateDelta final_delta;
+    final_delta.schema = new_schema;
+    final_delta.load_info = staged_load_info;
+    final_delta.commit_ts = current->commit_ts;
+
+    ASSERT_NO_THROW(sealed->TestStageLoadIndexThenPublish(
+        load_info,
+        false,
+        new_schema,
+        runtime,
+        staged.get(),
+        current,
+        final_delta,
+        [&] {
+            auto published_after_staged_load =
+                sealed->TestGetPublishedStateSnapshot();
+            EXPECT_FALSE(
+                published_after_staged_load->schema->get_fields().count(
+                    new_vec));
+            EXPECT_EQ(published_after_staged_load->index_ready_bitset.size(),
+                      1);
+            EXPECT_FALSE(sealed->TestVectorIndexReady(new_vec));
+
+            EXPECT_TRUE(GetFieldBit(staged->index_ready_bitset, new_vec));
+            EXPECT_TRUE(staged->published_index_has_raw_data.at(new_vec));
+        }));
+    auto final_state = sealed->TestGetPublishedStateSnapshot();
+    EXPECT_TRUE(GetFieldBit(final_state->index_ready_bitset, new_vec));
+    EXPECT_TRUE(final_state->index_has_raw_data.at(new_vec));
+    EXPECT_TRUE(sealed->TestVectorIndexReady(new_vec));
+}
+
+TEST(SealedSegmentCowState, StagedVectorIndexSkipsInterimIndexGeneration) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto vec = schema->AddDebugField(
+        "vec", DataType::VECTOR_FLOAT, 4, knowhere::metric::L2);
+    schema->set_primary_field_id(pk);
+
+    std::map<std::string, std::string> index_params = {
+        {"index_type", knowhere::IndexEnum::INDEX_FAISS_IVFFLAT},
+        {"metric_type", knowhere::metric::L2},
+        {"nlist", "64"}};
+    std::map<std::string, std::string> type_params = {{"dim", "4"}};
+    FieldIndexMeta field_index_meta(
+        vec, std::move(index_params), std::move(type_params));
+    std::map<FieldId, FieldIndexMeta> field_indexes = {{vec, field_index_meta}};
+    IndexMetaPtr index_meta =
+        std::make_shared<CollectionIndexMeta>(100000, std::move(field_indexes));
+
+    auto config = SegcoreConfig::default_config();
+    config.set_enable_interim_segment_index(true);
+    config.set_chunk_rows(1024);
+    config.set_dense_vector_intermin_index_type(
+        knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC);
+    config.set_nlist(16);
+    config.set_nprobe(16);
+
+    auto dataset = DataGen(schema, 1000);
+    auto data_segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    auto* data_sealed =
+        dynamic_cast<ChunkedSegmentSealedImpl*>(data_segment.get());
+    ASSERT_NE(data_sealed, nullptr);
+    auto data_runtime = data_sealed->TestCloneMutableRuntimeResourceState();
+    ASSERT_TRUE(data_runtime->fields.count(vec));
+    auto loaded_column = data_runtime->fields.at(vec);
+    auto row_count = dataset.raw_->num_rows();
+
+    auto unstaged_segment = CreateSealedSegment(schema, index_meta, 0, config);
+    auto* unstaged =
+        dynamic_cast<ChunkedSegmentSealedImpl*>(unstaged_segment.get());
+    ASSERT_NE(unstaged, nullptr);
+    ASSERT_TRUE(
+        unstaged->TestGenerateInterimIndex(vec, row_count, loaded_column));
+
+    auto segment = CreateSealedSegment(schema, index_meta, 0, config);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    auto staged_load_info = std::make_shared<const SegmentLoadInfo>(
+        current->load_info->GetProto(), schema);
+    ChunkedSegmentSealedImpl::StateDelta initial_delta;
+    initial_delta.schema = schema;
+    initial_delta.load_info = staged_load_info;
+    initial_delta.runtime = sealed->TestFreezeRuntimeResourceState(runtime);
+    initial_delta.commit_ts = current->commit_ts;
+    auto staged = sealed->TestBuildNextPublishedState(current, initial_delta);
+
+    milvus::index::CreateIndexInfo create_index_info;
+    create_index_info.field_type = DataType::VECTOR_FLOAT;
+    create_index_info.metric_type = knowhere::metric::L2;
+    create_index_info.index_type = knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
+    create_index_info.index_engine_version =
+        knowhere::Version::GetCurrentVersion().VersionNumber();
+    auto indexing = milvus::index::IndexFactory::GetInstance().CreateIndex(
+        create_index_info, milvus::storage::FileManagerContext());
+
+    LoadIndexInfo load_info;
+    load_info.field_id = vec.get();
+    load_info.index_params = GenIndexParams(indexing.get());
+    load_info.index_params["metric_type"] = knowhere::metric::L2;
+    load_info.cache_index =
+        CreateTestCacheIndex("staged-real-vector", std::move(indexing));
+    load_info.load_resource_request = LoadResourceRequest{0, 0, 0, 0, true};
+
+    ChunkedSegmentSealedImpl::StateDelta final_delta;
+    final_delta.schema = schema;
+    final_delta.load_info = staged_load_info;
+    final_delta.commit_ts = current->commit_ts;
+
+    milvus::OpContext op_ctx;
+    ASSERT_NO_THROW(sealed->TestStageLoadIndexGenerateInterimThenPublish(
+        load_info,
+        false,
+        schema,
+        runtime,
+        staged.get(),
+        current,
+        final_delta,
+        loaded_column,
+        row_count,
+        &op_ctx,
+        [&](bool generated_interim) {
+            EXPECT_FALSE(generated_interim);
+            EXPECT_TRUE(GetFieldBit(staged->index_ready_bitset, vec));
+            EXPECT_FALSE(GetFieldBit(staged->binlog_index_bitset, vec));
+            EXPECT_TRUE(staged->published_index_has_raw_data.at(vec));
+        }));
+
+    auto final_state = sealed->TestGetPublishedStateSnapshot();
+    EXPECT_TRUE(GetFieldBit(final_state->index_ready_bitset, vec));
+    EXPECT_FALSE(GetFieldBit(final_state->binlog_index_bitset, vec));
+    EXPECT_TRUE(final_state->index_has_raw_data.at(vec));
+    EXPECT_TRUE(sealed->TestVectorIndexReady(vec));
+}
+
+TEST(SealedSegmentCowState,
+     StagedVectorIndexRetiresPublishedWarmupOnlyAfterPublish) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto vec = schema->AddDebugField(
+        "vec", DataType::VECTOR_FLOAT, 4, knowhere::metric::L2);
+    schema->set_primary_field_id(pk);
+
+    auto warmup_limit = cachinglayer::ResourceUsage{1024 * 1024, 0};
+    auto warmup_dlist = std::make_shared<cachinglayer::internal::DList>(
+        false,
+        warmup_limit,
+        warmup_limit,
+        warmup_limit,
+        cachinglayer::EvictionConfig{});
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto create_index = [] {
+        milvus::index::CreateIndexInfo create_index_info;
+        create_index_info.field_type = DataType::VECTOR_FLOAT;
+        create_index_info.metric_type = knowhere::metric::L2;
+        create_index_info.index_type = knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
+        create_index_info.index_engine_version =
+            knowhere::Version::GetCurrentVersion().VersionNumber();
+        return milvus::index::IndexFactory::GetInstance().CreateIndex(
+            create_index_info, milvus::storage::FileManagerContext());
+    };
+
+    folly::CancellationToken published_warmup_token;
+    std::promise<void> warmup_started;
+    auto warmup_started_future = warmup_started.get_future();
+    auto published_index_impl = create_index();
+    auto published_index_params = GenIndexParams(published_index_impl.get());
+    auto published_cache_index =
+        CreateCancellationObservingCacheIndex("published-vector",
+                                              std::move(published_index_impl),
+                                              &published_warmup_token,
+                                              &warmup_started,
+                                              warmup_dlist.get());
+    auto warmup_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+    published_cache_index->Warmup(nullptr, warmup_pool);
+    ASSERT_EQ(warmup_started_future.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    ASSERT_FALSE(published_warmup_token.isCancellationRequested());
+
+    LoadIndexInfo published_index;
+    published_index.field_id = vec.get();
+    published_index.index_params = std::move(published_index_params);
+    published_index.index_params["metric_type"] = knowhere::metric::L2;
+    published_index.cache_index = published_cache_index;
+    published_index.load_resource_request =
+        LoadResourceRequest{0, 0, 0, 0, true};
+    sealed->LoadIndex(published_index);
+
+    auto stage_replacement = [&](bool fail_before_publish) {
+        auto current = sealed->TestGetPublishedStateSnapshot();
+        auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+        auto staged = sealed->TestBuildNextPublishedState(
+            current,
+            {current->schema,
+             current->load_info,
+             sealed->TestFreezeRuntimeResourceState(runtime),
+             current->commit_ts});
+
+        auto replacement_impl = create_index();
+        LoadIndexInfo replacement;
+        replacement.field_id = vec.get();
+        replacement.index_params = GenIndexParams(replacement_impl.get());
+        replacement.index_params["metric_type"] = knowhere::metric::L2;
+        replacement.cache_index = CreateTestCacheIndex(
+            fail_before_publish ? "rolled-back-vector" : "replacement-vector",
+            std::move(replacement_impl));
+        replacement.load_resource_request =
+            LoadResourceRequest{0, 0, 0, 0, true};
+
+        ChunkedSegmentSealedImpl::StateDelta final_delta;
+        final_delta.schema = current->schema;
+        final_delta.load_info = current->load_info;
+        final_delta.commit_ts = current->commit_ts;
+
+        auto stage_and_publish = [&] {
+            sealed->TestStageLoadIndexThenPublish(
+                replacement,
+                true,
+                current->schema,
+                runtime,
+                staged.get(),
+                current,
+                final_delta,
+                [&] {
+                    auto published = sealed->TestGetPublishedStateSnapshot();
+                    ASSERT_EQ(
+                        published->runtime->vector_indexings.at(vec)->indexing_,
+                        published_cache_index);
+                    EXPECT_FALSE(
+                        published_warmup_token.isCancellationRequested());
+                    if (fail_before_publish) {
+                        throw std::runtime_error("abort staged publish");
+                    }
+                });
+        };
+
+        if (fail_before_publish) {
+            EXPECT_THROW(stage_and_publish(), std::runtime_error);
+        } else {
+            EXPECT_NO_THROW(stage_and_publish());
+        }
+    };
+
+    stage_replacement(true);
+    EXPECT_FALSE(published_warmup_token.isCancellationRequested());
+    auto after_rollback = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(after_rollback->runtime->vector_indexings.at(vec)->indexing_,
+              published_cache_index);
+
+    stage_replacement(false);
+    EXPECT_TRUE(published_warmup_token.isCancellationRequested());
+    auto after_publish = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_NE(after_publish->runtime->vector_indexings.at(vec)->indexing_,
+              published_cache_index);
+}
+
+TEST(SealedSegmentCowState, ReplaceScalarIndexStagesRuntimeUntilFinalPublish) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto payload = schema->AddDebugField("payload", DataType::INT64);
+    schema->set_primary_field_id(pk);
+
+    auto dataset = DataGen(schema, 4);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    LoadIndexInfo first_index;
+    first_index.field_id = payload.get();
+    first_index.field_type = DataType::INT64;
+    first_index.index_params["index_type"] = "STL_SORT";
+    auto payload_data = dataset.get_col<int64_t>(payload);
+    auto first_impl = GenScalarIndexing<int64_t>(dataset.raw_->num_rows(),
+                                                 payload_data.data());
+    first_index.index_params = GenIndexParams(first_impl.get());
+    first_index.cache_index =
+        CreateTestCacheIndex("first", std::move(first_impl));
+    auto first_cache_index = first_index.cache_index;
+    sealed->LoadIndex(first_index);
+
+    auto before = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_NE(before, nullptr);
+    ASSERT_NE(before->runtime, nullptr);
+    ASSERT_TRUE(before->runtime->scalar_indexings.count(payload) > 0);
+    auto published_before_replace =
+        before->runtime->scalar_indexings.at(payload);
+    ASSERT_EQ(published_before_replace, first_cache_index);
+
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    ASSERT_TRUE(runtime->scalar_indexings.count(payload) > 0);
+    auto stale_runtime_index = runtime->scalar_indexings.at(payload);
+    ASSERT_EQ(stale_runtime_index, first_cache_index);
+
+    LoadIndexInfo replacement_index;
+    replacement_index.field_id = payload.get();
+    replacement_index.field_type = DataType::INT64;
+    replacement_index.index_params["index_type"] = "STL_SORT";
+    auto replacement_impl = GenScalarIndexing<int64_t>(dataset.raw_->num_rows(),
+                                                       payload_data.data());
+    replacement_index.index_params = GenIndexParams(replacement_impl.get());
+    replacement_index.cache_index =
+        CreateTestCacheIndex("replacement", std::move(replacement_impl));
+    auto replacement_cache_index = replacement_index.cache_index;
+
+    sealed->TestLoadIndex(replacement_index, true, runtime.get());
+
+    ASSERT_TRUE(runtime->scalar_indexings.count(payload) > 0);
+    EXPECT_EQ(runtime->scalar_indexings.size(), 1);
+    auto updated_runtime_index = runtime->scalar_indexings.at(payload);
+    EXPECT_EQ(updated_runtime_index, replacement_cache_index);
+    EXPECT_NE(updated_runtime_index, stale_runtime_index);
+
+    auto staged_only = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_NE(staged_only, nullptr);
+    ASSERT_NE(staged_only->runtime, nullptr);
+    ASSERT_TRUE(staged_only->runtime->scalar_indexings.count(payload) > 0);
+    EXPECT_EQ(staged_only->runtime->scalar_indexings.at(payload),
+              first_cache_index);
+
+    ChunkedSegmentSealedImpl::StateDelta delta;
+    delta.schema = staged_only->schema;
+    delta.load_info = staged_only->load_info;
+    delta.runtime = sealed->TestFreezeRuntimeResourceState(std::move(runtime));
+    delta.commit_ts = staged_only->commit_ts;
+
+    auto next = sealed->TestBuildNextPublishedState(staged_only, delta);
+    ASSERT_NE(next, nullptr);
+    ASSERT_NE(next->runtime, nullptr);
+    EXPECT_EQ(next->runtime->scalar_indexings.size(), 1);
+    ASSERT_TRUE(next->runtime->scalar_indexings.count(payload) > 0);
+    auto published_runtime_index = next->runtime->scalar_indexings.at(payload);
+    EXPECT_EQ(published_runtime_index, replacement_cache_index);
+    EXPECT_NE(published_runtime_index, stale_runtime_index);
+    EXPECT_EQ(next->runtime->ngram_fields.count(payload), 0);
+}
+
+TEST(SealedSegmentCowState, ClearPublishedStateDropsRuntimeSnapshot) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto payload = schema->AddDebugField("payload", DataType::INT64);
+    schema->set_primary_field_id(pk);
+
+    auto dataset = DataGen(schema, 1);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, dataset);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto before = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_NE(before, nullptr);
+    ASSERT_NE(before->runtime, nullptr);
+    ASSERT_TRUE(before->runtime->fields.count(payload) > 0);
+
+    sealed->TestClearPublishedState();
+
+    auto after = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->runtime, nullptr);
+    EXPECT_FALSE(GetFieldBit(after->field_data_ready_bitset, payload));
+}
+
+TEST(SealedSegmentCowState, JsonStatsLivesInRuntimeSnapshot) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto json = schema->AddDebugField("payload", DataType::JSON);
+    schema->set_primary_field_id(pk);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    auto load_runtime = sealed->TestCloneMutableRuntimeResourceState();
+    load_runtime->json_stats[json] = nullptr;
+
+    ChunkedSegmentSealedImpl::StateDelta load_delta;
+    load_delta.schema = current->schema;
+    load_delta.load_info = current->load_info;
+    load_delta.runtime =
+        sealed->TestFreezeRuntimeResourceState(std::move(load_runtime));
+    load_delta.commit_ts = current->commit_ts;
+
+    auto after_load = sealed->TestBuildNextPublishedState(current, load_delta);
+    ASSERT_NE(after_load, nullptr);
+    ASSERT_NE(after_load->runtime, nullptr);
+    ASSERT_EQ(after_load->runtime->json_stats.count(json), 1);
+
+    auto drop_runtime =
+        std::make_shared<ChunkedSegmentSealedImpl::RuntimeResourceState>(
+            *after_load->runtime);
+    ASSERT_EQ(drop_runtime->json_stats.count(json), 1);
+    drop_runtime->json_stats.erase(json);
+
+    ChunkedSegmentSealedImpl::StateDelta delta;
+    delta.schema = after_load->schema;
+    delta.load_info = after_load->load_info;
+    delta.runtime =
+        sealed->TestFreezeRuntimeResourceState(std::move(drop_runtime));
+    delta.commit_ts = after_load->commit_ts;
+
+    auto next = sealed->TestBuildNextPublishedState(after_load, delta);
+    ASSERT_NE(next, nullptr);
+    ASSERT_NE(next->runtime, nullptr);
+    EXPECT_EQ(next->runtime->json_stats.count(json), 0);
+}
+
+TEST(SealedSegmentCowState, ExternalSyntheticFieldsUseStagedLoadInfoRows) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    schema->set_external_source("s3://bucket/data");
+    schema->set_external_spec(R"({"format":"parquet"})");
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    proto::segcore::SegmentLoadInfo published_proto;
+    published_proto.set_segmentid(1001);
+    published_proto.set_num_of_rows(3);
+    sealed->SetLoadInfo(published_proto);
+
+    proto::segcore::SegmentLoadInfo staged_proto;
+    staged_proto.set_segmentid(1001);
+    staged_proto.set_num_of_rows(7);
+    SegmentLoadInfo staged_load_info(staged_proto, schema);
+
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    sealed->TestSynthesizeExternalSystemFields(
+        staged_load_info, schema, runtime.get());
+
+    ASSERT_TRUE(runtime->fields.count(pk) > 0);
+    ASSERT_NE(runtime->timestamps, nullptr);
+    EXPECT_EQ(runtime->timestamps->size(), 7);
+    EXPECT_EQ((*runtime->timestamps)[0], 0);
+    EXPECT_EQ((*runtime->timestamps)[6], 0);
+
+    auto published = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_NE(published, nullptr);
+    ASSERT_NE(published->load_info, nullptr);
+    EXPECT_EQ(published->load_info->GetNumOfRows(), 3);
+}
+
+TEST(SealedSegmentCowState,
+     PublishRuntimeStateRecomputesExternalSystemFieldReady) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    schema->set_external_source("s3://bucket/data");
+    schema->set_external_spec(R"({"format":"parquet"})");
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    proto::segcore::SegmentLoadInfo published_proto;
+    published_proto.set_segmentid(1002);
+    published_proto.set_num_of_rows(7);
+    sealed->SetLoadInfo(published_proto);
+
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    SegmentLoadInfo staged_load_info(published_proto, schema);
+    sealed->TestSynthesizeExternalSystemFields(
+        staged_load_info, schema, runtime.get());
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    auto next = sealed->TestBuildNextPublishedState(
+        current,
+        {current->schema,
+         current->load_info,
+         sealed->TestFreezeRuntimeResourceState(std::move(runtime)),
+         current->commit_ts});
+
+    ASSERT_NE(next, nullptr);
+    EXPECT_TRUE(next->system_field_ready);
+    ASSERT_NE(next->runtime, nullptr);
+    ASSERT_NE(next->runtime->timestamps, nullptr);
+    EXPECT_EQ(next->runtime->timestamps->size(), 7);
+    EXPECT_EQ((*next->runtime->timestamps)[0], 0);
+}
+
+TEST(SealedSegmentCowState,
+     ExternalPublicLoadColumnGroupsUsesStagedRuntimeForSyntheticFields) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    schema->set_external_source("s3://bucket/data");
+    schema->set_external_spec(R"({"format":"parquet"})");
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    proto::segcore::SegmentLoadInfo published_proto;
+    published_proto.set_segmentid(1003);
+    published_proto.set_num_of_rows(3);
+    sealed->SetLoadInfo(published_proto);
+
+    proto::segcore::SegmentLoadInfo staged_proto;
+    staged_proto.set_segmentid(1003);
+    staged_proto.set_num_of_rows(7);
+    SegmentLoadInfo staged_load_info(staged_proto, schema);
+
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    sealed->TestSynthesizeExternalSystemFields(
+        staged_load_info, schema, runtime.get());
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    auto next = sealed->TestBuildNextPublishedState(
+        current,
+        {current->schema,
+         current->load_info,
+         sealed->TestFreezeRuntimeResourceState(std::move(runtime)),
+         current->commit_ts});
+
+    ASSERT_NE(next, nullptr);
+    ASSERT_NE(next->runtime, nullptr);
+    auto it = next->runtime->fields.find(pk);
+    ASSERT_TRUE(it != next->runtime->fields.end());
+    ASSERT_NE(it->second, nullptr);
+    EXPECT_TRUE(next->system_field_ready);
+}
+
+TEST(SealedSegmentCowState, ExternalSynthesizeRequiresRuntime) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    schema->set_external_source("s3://bucket/data");
+    schema->set_external_spec(R"({"format":"parquet"})");
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    proto::segcore::SegmentLoadInfo published_proto;
+    published_proto.set_segmentid(1004);
+    published_proto.set_num_of_rows(3);
+    sealed->SetLoadInfo(published_proto);
+
+    SegmentLoadInfo staged_load_info(published_proto, schema);
+    EXPECT_ANY_THROW(sealed->TestSynthesizeExternalSystemFields(
+        staged_load_info, schema, nullptr));
+}
+
+TEST(SealedSegmentCowState, ExternalWrapperSynthesizeRequiresRuntime) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    schema->set_external_source("s3://bucket/data");
+    schema->set_external_spec(R"({"format":"parquet"})");
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    proto::segcore::SegmentLoadInfo published_proto;
+    published_proto.set_segmentid(1005);
+    published_proto.set_num_of_rows(3);
+    sealed->SetLoadInfo(published_proto);
+
+    EXPECT_ANY_THROW(sealed->TestSynthesizeExternalSystemFields(nullptr));
 }

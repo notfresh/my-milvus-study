@@ -70,7 +70,7 @@ ExecPlanNodeVisitor::ExecuteTask(
                 AssertInfo(first_column,
                            "first column must be a column vector");
                 if (first_column->IsBitmap()) {
-                    if (query_context->get_active_element_count() > 0) {
+                    if (query_context->bitset_is_element_level()) {
                         Assert(processed_num ==
                                query_context->get_active_element_count());
                     } else {
@@ -451,6 +451,7 @@ ExecPlanNodeVisitor::visit(VectorPlanNode& node) {
             }
 
             auto op_context = milvus::OpContext(cancel_token_);
+            op_context.trace_span = trace_span_;
             query_context->set_op_context(&op_context);
 
             auto result = ExecuteTask(plan_fragment, query_context);
@@ -510,6 +511,7 @@ ExecPlanNodeVisitor::visit(VectorPlanNode& node) {
 
     // Set op context to query context
     auto op_context = milvus::OpContext(cancel_token_);
+    op_context.trace_span = trace_span_;
     query_context->set_op_context(&op_context);
 
     // Do plan fragment task work

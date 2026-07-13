@@ -213,7 +213,7 @@ class TestMilvusClientQueryInvalid(TestMilvusClientV2Base):
         else:
             error = {
                 ct.err_code: 65535,
-                ct.err_msg: f"cannot parse expression: {term_expr}, error: field invalid_field not exist",
+                ct.err_msg: "field invalid_field not exist",
             }
             self.query(client, collection_name, filter=term_expr, check_task=CheckTasks.err_res, check_items=error)
         self.drop_collection(client, collection_name)
@@ -499,15 +499,14 @@ class TestMilvusClientQueryInvalidShared(TestMilvusClientV2Base):
         expr_1 = f"{ct.default_int64_field_name} inn [1, 2]"
         error_1 = {
             ct.err_code: 65535,
-            ct.err_msg: "cannot parse expression: int64 inn [1, 2], error: invalid expression: int64 inn [1, 2]",
+            ct.err_msg: "invalid expression: int64 inn [1, 2]",
         }
         self.query(client, INVALID_SHARED_COLLECTION, filter=expr_1, check_task=CheckTasks.err_res, check_items=error_1)
 
         expr_2 = f"{ct.default_int64_field_name} in not [1, 2]"
         error_2 = {
             ct.err_code: 65535,
-            ct.err_msg: "cannot parse expression: int64 in not [1, 2], "
-            "error: not can only apply on boolean: invalid parameter",
+            ct.err_msg: "not can only apply on boolean",
         }
         self.query(client, INVALID_SHARED_COLLECTION, filter=expr_2, check_task=CheckTasks.err_res, check_items=error_2)
 
@@ -523,15 +522,14 @@ class TestMilvusClientQueryInvalidShared(TestMilvusClientV2Base):
         for expr in exprs:
             error = {
                 ct.err_code: 1100,
-                ct.err_msg: f"cannot parse expression: {expr}, error: the right-hand side of 'in' must be a list",
+                ct.err_msg: "the right-hand side of 'in' must be a list",
             }
             self.query(client, INVALID_SHARED_COLLECTION, filter=expr, check_task=CheckTasks.err_res, check_items=error)
 
         expr = f"{ct.default_int64_field_name} in (mn)"
         error = {
             ct.err_code: 1100,
-            ct.err_msg: f"cannot parse expression: {expr}, "
-            "error: value '(mn)' in list cannot be a non-const expression",
+            ct.err_msg: "value '(mn)' in list cannot be a non-const expression",
         }
         self.query(client, INVALID_SHARED_COLLECTION, filter=expr, check_task=CheckTasks.err_res, check_items=error)
 
@@ -548,8 +546,7 @@ class TestMilvusClientQueryInvalidShared(TestMilvusClientV2Base):
         term_expr = f"{default_primary_key_field_name} in {values}"
         error = {
             ct.err_code: 1100,
-            ct.err_msg: f"failed to create query plan: cannot parse expression: {term_expr}, "
-            "error: value 'float_val:1' in list cannot be casted to Int64",
+            ct.err_msg: "value 'float_val:1' in list cannot be casted to Int64",
         }
         self.query(
             client, INVALID_SHARED_COLLECTION, filter=term_expr, check_task=CheckTasks.err_res, check_items=error
@@ -559,8 +556,7 @@ class TestMilvusClientQueryInvalidShared(TestMilvusClientV2Base):
         term_expr = f"{default_primary_key_field_name} in {values}"
         error = {
             ct.err_code: 1100,
-            ct.err_msg: f"failed to create query plan: cannot parse expression: {term_expr}, "
-            "error: value 'float_val:2' in list cannot be casted to Int64",
+            ct.err_msg: "value 'float_val:2' in list cannot be casted to Int64",
         }
         self.query(
             client, INVALID_SHARED_COLLECTION, filter=term_expr, check_task=CheckTasks.err_res, check_items=error
@@ -681,7 +677,10 @@ class TestMilvusClientQueryInvalidShared(TestMilvusClientV2Base):
         expected: raise invalid-limit error
         """
         client = self._client()
-        error = {ct.err_code: 1, ct.err_msg: f"limit [{limit}] is invalid"}
+        # milvus strips leading/trailing whitespace before echoing the value
+        # in the error message, so " " becomes "" in `limit [<displayed>] is invalid`
+        displayed = limit.strip() if isinstance(limit, str) else limit
+        error = {ct.err_code: 1, ct.err_msg: f"limit [{displayed}] is invalid"}
         self.query(
             client,
             INVALID_SHARED_COLLECTION,
@@ -729,7 +728,10 @@ class TestMilvusClientQueryInvalidShared(TestMilvusClientV2Base):
         expected: raise invalid-offset error
         """
         client = self._client()
-        error = {ct.err_code: 1, ct.err_msg: f"offset [{offset}] is invalid"}
+        # milvus strips leading/trailing whitespace before echoing the value
+        # in the error message, so " " becomes "" in `offset [<displayed>] is invalid`
+        displayed = offset.strip() if isinstance(offset, str) else offset
+        error = {ct.err_code: 1, ct.err_msg: f"offset [{displayed}] is invalid"}
         self.query(
             client,
             INVALID_SHARED_COLLECTION,
@@ -801,6 +803,68 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
             check_task=CheckTasks.check_query_results,
             check_items={exp_res: rows, "with_vec": True, "pk_name": default_primary_key_field_name},
         )
+        self.drop_collection(client, collection_name)
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_client_query_with_multiple_namespaces(self):
+        """
+        target: test query with namespace enabled
+        method: create namespace-enabled collection with multiple shards, insert rows into multiple namespaces, then query by namespace
+        expected: query only returns rows from the requested namespace
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        shards_num = 4
+        self.create_collection(
+            client,
+            collection_name,
+            default_dim,
+            consistency_level="Strong",
+            enable_namespace=True,
+            shards_num=shards_num,
+        )
+
+        desc = self.describe_collection(client, collection_name)[0]
+        assert desc["enable_namespace"] is True
+        assert desc["num_shards"] == shards_num
+
+        rng = np.random.default_rng(seed=19530)
+        namespaces = [f"namespace_{i}" for i in range(8)]
+        nb_per_namespace = 10
+        ids_by_namespace = {
+            namespace: [idx * 1000 + i for i in range(nb_per_namespace)]
+            for idx, namespace in enumerate(namespaces)
+        }
+        for namespace, ids in ids_by_namespace.items():
+            rows = [
+                {
+                    default_primary_key_field_name: pk,
+                    default_vector_field_name: list(rng.random((1, default_dim))[0]),
+                }
+                for pk in ids
+            ]
+            self.insert(client, collection_name, rows, namespace=namespace)
+
+        for namespace, expected_ids in ids_by_namespace.items():
+            res = self.query(
+                client,
+                collection_name,
+                filter=default_search_exp,
+                output_fields=[default_primary_key_field_name],
+                namespace=namespace,
+            )[0]
+            assert {r[default_primary_key_field_name] for r in res} == set(expected_ids)
+
+        first_id_per_namespace = [ids[0] for ids in ids_by_namespace.values()]
+        for namespace, expected_ids in ids_by_namespace.items():
+            filtered = self.query(
+                client,
+                collection_name,
+                filter=f"{default_primary_key_field_name} in {first_id_per_namespace}",
+                output_fields=[default_primary_key_field_name],
+                namespace=namespace,
+            )[0]
+            assert {r[default_primary_key_field_name] for r in filtered} == {expected_ids[0]}
         self.drop_collection(client, collection_name)
 
     @pytest.mark.tags(CaseLabel.L1)
@@ -1550,8 +1614,7 @@ class TestMilvusClientQueryValid(TestMilvusClientV2Base):
         not_support_expr = f"{ct.default_bool_field_name} in [0]"
         error = {
             ct.err_code: 65535,
-            ct.err_msg: "cannot parse expression: bool in [0], error: "
-            "value 'int64_val:0' in list cannot be casted to Bool",
+            ct.err_msg: "value 'int64_val:0' in list cannot be casted to Bool",
         }
         self.query(
             client,
@@ -5031,7 +5094,7 @@ class TestQueryStringPrimaryShared(TestMilvusClientV2Base):
         expression = 'float like "0%"'
         error = {
             ct.err_code: 65535,
-            ct.err_msg: f"cannot parse expression: {expression}, error: like operation on non-string or no-json field is unsupported",
+            ct.err_msg: "like operation on non-string or no-json field is unsupported",
         }
         self.query(
             client,
@@ -5080,8 +5143,7 @@ class TestQueryStringPrimaryShared(TestMilvusClientV2Base):
         expression = "varchar == int64"
         error = {
             ct.err_code: 1100,
-            ct.err_msg: f"failed to create query plan: cannot parse expression: {expression}, "
-            f"error: comparisons between VarChar and Int64 are not supported: invalid parameter",
+            ct.err_msg: "comparisons between VarChar and Int64 are not supported",
         }
         self.query(
             client,

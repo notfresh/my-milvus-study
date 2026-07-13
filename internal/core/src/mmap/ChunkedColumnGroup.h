@@ -76,6 +76,10 @@ class ChunkedColumnGroup {
 
     PinWrapper<GroupChunk*>
     GetGroupChunk(milvus::OpContext* op_ctx, int64_t chunk_id) const {
+        AssertInfo(
+            chunk_id >= 0 && chunk_id < num_chunks_,
+            "[StorageV2] chunk_id out of range: " + std::to_string(chunk_id) +
+                ", num_chunks: " + std::to_string(num_chunks_));
         auto ca = SemiInlineGet(slot_->PinCells(op_ctx, {chunk_id}));
         auto chunk = ca->get_cell_of(chunk_id);
         return PinWrapper<GroupChunk*>(std::move(ca), chunk);
@@ -84,7 +88,20 @@ class ChunkedColumnGroup {
     std::shared_ptr<CellAccessor<GroupChunk>>
     GetGroupChunks(milvus::OpContext* op_ctx,
                    const std::vector<int64_t>& chunk_ids) {
+        for (auto chunk_id : chunk_ids) {
+            AssertInfo(chunk_id >= 0 && chunk_id < num_chunks_,
+                       "[StorageV2] chunk_id out of range: " +
+                           std::to_string(chunk_id) +
+                           ", num_chunks: " + std::to_string(num_chunks_));
+        }
         return SemiInlineGet(slot_->PinCells(op_ctx, chunk_ids));
+    }
+
+    bool
+    CellsLoaded(const std::vector<cachinglayer::cid_t>& cids) const {
+        return std::all_of(cids.begin(), cids.end(), [this](cid_t cid) {
+            return slot_->IsCached(cid);
+        });
     }
 
     std::vector<PinWrapper<GroupChunk*>>
@@ -291,6 +308,15 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
     PrefetchChunks(milvus::OpContext* op_ctx,
                    const std::vector<int64_t>& chunk_ids) const override {
         group_->GetGroupChunks(op_ctx, chunk_ids);
+    }
+
+    bool
+    CellsLoaded(const int64_t* offsets, int64_t count) const override {
+        if (count == 0) {
+            return true;
+        }
+        auto [cids, offsets_in_chunk] = ToChunkIdAndOffset(offsets, count);
+        return group_->CellsLoaded(cids);
     }
 
     PinWrapper<SpanBase>
@@ -597,9 +623,14 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
         } else {
             auto [cids, offsets_in_chunk] = ToChunkIdAndOffset(offsets, count);
             auto ca = group_->GetGroupChunks(op_ctx, cids);
+            std::vector<std::shared_ptr<Chunk>> chunks(num_chunks());
             for (int64_t i = 0; i < count; i++) {
-                auto* group_chunk = ca->get_cell_of(cids[i]);
-                auto chunk = group_chunk->GetChunk(field_id_);
+                auto cid = cids[i];
+                auto& chunk = chunks[cid];
+                if (chunk == nullptr) {
+                    auto* group_chunk = ca->get_cell_of(cid);
+                    chunk = group_chunk->GetChunk(field_id_);
+                }
                 auto valid = chunk->isValid(offsets_in_chunk[i]);
                 auto value = static_cast<StringChunk*>(chunk.get())
                                  ->

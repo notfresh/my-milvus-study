@@ -23,7 +23,6 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/errors"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
@@ -31,9 +30,10 @@ import (
 	storage "github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagecommon"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/retry"
@@ -113,7 +113,6 @@ func (bw *BulkPackWriterV3) Write(ctx context.Context, pack *SyncPack) (
 	size int64,
 	err error,
 ) {
-	log := log.Ctx(ctx)
 	bw.initialManifestPath = bw.manifestPath
 
 	// Drain deferred metaCache actions on successful Write only. If we
@@ -153,19 +152,19 @@ func (bw *BulkPackWriterV3) Write(ctx context.Context, pack *SyncPack) (
 	}()
 
 	if inserts, insertFiles, err = bw.writeInserts(ctx, pack, basePath); err != nil {
-		log.Warn("failed to write insert data", zap.Error(err))
+		mlog.Warn(ctx, "failed to write insert data", mlog.Err(err))
 		return
 	}
 	if stats, statEntries, err = bw.writeStats(ctx, pack, basePath); err != nil {
-		log.Warn("failed to process stats blob", zap.Error(err))
+		mlog.Warn(ctx, "failed to process stats blob", mlog.Err(err))
 		return
 	}
 	if deltas, deltaEntries, err = bw.writeDelta(ctx, pack, basePath); err != nil {
-		log.Warn("failed to process delta blob", zap.Error(err))
+		mlog.Warn(ctx, "failed to process delta blob", mlog.Err(err))
 		return
 	}
 	if bm25Stats, bm25Entries, err = bw.writeBM25Stasts(ctx, pack, basePath); err != nil {
-		log.Warn("failed to process bm25 stats blob", zap.Error(err))
+		mlog.Warn(ctx, "failed to process bm25 stats blob", mlog.Err(err))
 		return
 	}
 
@@ -242,9 +241,9 @@ func (bw *BulkPackWriterV3) writeInserts(ctx context.Context, pack *SyncPack, ba
 	textColumnConfigs := buildTextColumnConfigs(bw.schema, partitionBasePath)
 	var w packedBatchWriter
 	if len(textColumnConfigs) > 0 {
-		log.Ctx(ctx).Info("using TEXT-aware writer for import",
-			zap.Int("textFieldCount", len(textColumnConfigs)),
-			zap.String("basePath", basePath))
+		mlog.Info(ctx, "using TEXT-aware writer for import",
+			mlog.Int("textFieldCount", len(textColumnConfigs)),
+			mlog.String("basePath", basePath))
 		w, err = storage.NewPackedTextBatchWriter("", basePath, bw.schema,
 			bw.bufferSize, bw.multiPartUploadSize, bw.columnGroups, bw.storageConfig, textColumnConfigs, writerFormat, schemaBasedFormats)
 	} else {
@@ -270,10 +269,10 @@ func (bw *BulkPackWriterV3) writeInserts(ctx context.Context, pack *SyncPack, ba
 	}()
 
 	if err = w.Write(rec); err != nil {
-		log.Ctx(ctx).Warn("failed to write inserts",
-			zap.Int64("collectionID", pack.collectionID),
-			zap.Int64("segmentID", pack.segmentID),
-			zap.Error(err))
+		mlog.Warn(ctx, "failed to write inserts",
+			mlog.FieldCollectionID(pack.collectionID),
+			mlog.FieldSegmentID(pack.segmentID),
+			mlog.Err(err))
 		return nil, nil, err
 	}
 
@@ -292,27 +291,65 @@ func (bw *BulkPackWriterV3) writeInserts(ctx context.Context, pack *SyncPack, ba
 		return result
 	}
 
-	logs = make(map[int64]*datapb.FieldBinlog)
-	for _, columnGroup := range bw.columnGroups {
+	logs = buildV3ColumnGroupFieldBinlogs(
+		bw.columnGroups,
+		w.GetWrittenRowNum(),
+		tsFrom,
+		tsTo,
+		func(columnGroupID int64) int64 { return int64(w.GetColumnGroupWrittenCompressed(columnGroupID)) },
+		func(columnGroupID int64) int64 { return int64(w.GetColumnGroupWrittenUncompressed(columnGroupID)) },
+		nil,
+		w.GetWrittenPaths,
+		getFieldNullCounts,
+	)
+	return logs, files, nil
+}
+
+func buildV3ColumnGroupFieldBinlogs(
+	columnGroups []storagecommon.ColumnGroup,
+	entriesNum int64,
+	tsFrom uint64,
+	tsTo uint64,
+	compressedSize func(columnGroupID int64) int64,
+	memorySize func(columnGroupID int64) int64,
+	logID func(columnGroupID int64) int64,
+	logPath func(columnGroupID int64) string,
+	fieldNullCounts func(columnGroup storagecommon.ColumnGroup) map[int64]int64,
+) map[int64]*datapb.FieldBinlog {
+	logs := make(map[int64]*datapb.FieldBinlog, len(columnGroups))
+	for _, columnGroup := range columnGroups {
 		columnGroupID := columnGroup.GroupID
-		logs[columnGroupID] = &datapb.FieldBinlog{
+		fieldBinlog := &datapb.FieldBinlog{
 			FieldID:     columnGroupID,
 			ChildFields: columnGroup.Fields,
 			Format:      columnGroup.Format,
-			Binlogs: []*datapb.Binlog{
-				{
-					LogSize:         int64(w.GetColumnGroupWrittenCompressed(columnGroup.GroupID)),
-					MemorySize:      int64(w.GetColumnGroupWrittenUncompressed(columnGroup.GroupID)),
-					LogPath:         w.GetWrittenPaths(columnGroupID),
-					EntriesNum:      w.GetWrittenRowNum(),
-					TimestampFrom:   tsFrom,
-					TimestampTo:     tsTo,
-					FieldNullCounts: getFieldNullCounts(columnGroup),
-				},
-			},
 		}
+		if entriesNum > 0 {
+			binlog := &datapb.Binlog{
+				EntriesNum:    entriesNum,
+				TimestampFrom: tsFrom,
+				TimestampTo:   tsTo,
+			}
+			if compressedSize != nil {
+				binlog.LogSize = compressedSize(columnGroupID)
+			}
+			if memorySize != nil {
+				binlog.MemorySize = memorySize(columnGroupID)
+			}
+			if logID != nil {
+				binlog.LogID = logID(columnGroupID)
+			}
+			if logPath != nil {
+				binlog.LogPath = logPath(columnGroupID)
+			}
+			if fieldNullCounts != nil {
+				binlog.FieldNullCounts = fieldNullCounts(columnGroup)
+			}
+			fieldBinlog.Binlogs = []*datapb.Binlog{binlog}
+		}
+		logs[columnGroupID] = fieldBinlog
 	}
-	return logs, files, nil
+	return logs
 }
 
 func (bw *BulkPackWriterV3) resolveInsertWriterFormats() (string, []string, error) {
@@ -325,7 +362,7 @@ func (bw *BulkPackWriterV3) resolveInsertWriterFormats() (string, []string, erro
 		if version != packed.ManifestEarliest {
 			for _, columnGroup := range bw.columnGroups {
 				if columnGroup.Format == "" {
-					return "", nil, fmt.Errorf("column group %d fields %v missing format for existing manifest %s",
+					return "", nil, merr.WrapErrDataIntegrityMsg("column group %d fields %v missing format for existing manifest %s",
 						columnGroup.GroupID, columnGroup.Fields, bw.initialManifestPath)
 				}
 			}
@@ -346,7 +383,7 @@ func (bw *BulkPackWriterV3) writeDelta(ctx context.Context, pack *SyncPack, base
 
 	pkField, err := typeutil.GetPrimaryFieldSchema(bw.schema)
 	if err != nil {
-		return nil, nil, fmt.Errorf("primary key field not found: %w", err)
+		return nil, nil, merr.Wrap(err, "primary key field not found")
 	}
 
 	logID, err := bw.allocator.AllocOne()
@@ -361,20 +398,20 @@ func (bw *BulkPackWriterV3) writeDelta(ctx context.Context, pack *SyncPack, base
 		storage.WithStorageConfig(bw.storageConfig),
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create deltalog writer: %w", err)
+		return nil, nil, merr.Wrap(err, "failed to create deltalog writer")
 	}
 
 	record, _, _, err := storage.BuildDeleteRecord(pack.deltaData.Pks, pack.deltaData.Tss)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to build delete record: %w", err)
+		return nil, nil, merr.Wrap(err, "failed to build delete record")
 	}
 	defer record.Release()
 
 	if err := writer.Write(record); err != nil {
-		return nil, nil, fmt.Errorf("failed to write delta record: %w", err)
+		return nil, nil, merr.Wrap(err, "failed to write delta record")
 	}
 	if err := writer.Close(); err != nil {
-		return nil, nil, fmt.Errorf("failed to close delta writer: %w", err)
+		return nil, nil, merr.Wrap(err, "failed to close delta writer")
 	}
 
 	bw.sizeWritten += pack.deltaData.Size()

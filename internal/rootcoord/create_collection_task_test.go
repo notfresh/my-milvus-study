@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -34,7 +35,9 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/mocks"
 	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util"
@@ -1030,6 +1033,77 @@ func Test_createCollectionTask_prepareSchema(t *testing.T) {
 		}
 		err := task.prepareSchema(context.TODO())
 		assert.NoError(t, err)
+		properties := common.CloneKeyValuePairs(task.body.CollectionSchema.Properties).ToMap()
+		assert.Equal(t, "false", properties[common.NamespaceShardingEnabledKey])
+		enabled, err := common.IsNamespaceShardingEnabled(task.Req.Properties...)
+		assert.NoError(t, err)
+		assert.False(t, enabled)
+	})
+
+	t.Run("keeps explicit namespace sharding setting", func(t *testing.T) {
+		collectionName := funcutil.GenRandomStr()
+		field1 := funcutil.GenRandomStr()
+		schema := &schemapb.CollectionSchema{
+			Name:        collectionName,
+			Description: "",
+			AutoID:      false,
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:     field1,
+					DataType: schemapb.DataType_Int64,
+				},
+			},
+		}
+		task := createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+				Properties: []*commonpb.KeyValuePair{
+					{Key: common.NamespaceShardingEnabledKey, Value: "true"},
+				},
+			},
+			body: &message.CreateCollectionRequest{
+				CollectionSchema: schema,
+			},
+		}
+		err := task.prepareSchema(context.TODO())
+		assert.NoError(t, err)
+		properties := common.CloneKeyValuePairs(task.body.CollectionSchema.Properties).ToMap()
+		assert.Equal(t, "true", properties[common.NamespaceShardingEnabledKey])
+		enabled, err := common.IsNamespaceShardingEnabled(task.Req.Properties...)
+		assert.NoError(t, err)
+		assert.True(t, enabled)
+	})
+
+	t.Run("rejects invalid namespace sharding setting", func(t *testing.T) {
+		collectionName := funcutil.GenRandomStr()
+		field1 := funcutil.GenRandomStr()
+		schema := &schemapb.CollectionSchema{
+			Name:        collectionName,
+			Description: "",
+			AutoID:      false,
+			Fields: []*schemapb.FieldSchema{
+				{
+					Name:     field1,
+					DataType: schemapb.DataType_Int64,
+				},
+			},
+		}
+		task := createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+				Properties: []*commonpb.KeyValuePair{
+					{Key: common.NamespaceShardingEnabledKey, Value: "invalid"},
+				},
+			},
+			body: &message.CreateCollectionRequest{
+				CollectionSchema: schema,
+			},
+		}
+		err := task.prepareSchema(context.TODO())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid namespace.sharding.enabled")
 	})
 
 	t.Run("invalid data type", func(t *testing.T) {
@@ -1605,6 +1679,354 @@ func Test_createCollectionTask_prepareSchema(t *testing.T) {
 	})
 }
 
+func TestNextMilvusTableTargetOnlyFieldID(t *testing.T) {
+	source := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: common.StartOfUserFieldID, Name: "pk"},
+			{FieldID: common.StartOfUserFieldID + 3, Name: "vec"},
+		},
+	}
+	target := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 0, Name: common.VirtualPKFieldName},
+			{FieldID: common.StartOfUserFieldID, Name: "target_pk"},
+		},
+	}
+
+	next := nextMilvusTableTargetOnlyFieldID(source, target)
+	assert.Equal(t, int64(common.StartOfUserFieldID+4), next)
+}
+
+func TestPrepareMilvusTableSnapshotSchemaAlignsFieldIDs(t *testing.T) {
+	mockReadMetadata := mockey.Mock(packed.ReadMilvusTableSnapshotMetadata).
+		Return(&datapb.SnapshotMetadata{
+			Collection: &datapb.CollectionDescription{
+				Schema: &schemapb.CollectionSchema{
+					Fields: []*schemapb.FieldSchema{
+						{FieldID: common.RowIDField, Name: common.RowIDFieldName, DataType: schemapb.DataType_Int64},
+						{FieldID: 101, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+						{FieldID: 105, Name: "vec", DataType: schemapb.DataType_FloatVector},
+					},
+				},
+			},
+		}, nil).Build()
+	defer mockReadMetadata.UnPatch()
+
+	schema := &schemapb.CollectionSchema{
+		Name:           "target",
+		ExternalSource: "minio://localhost:9000/bucket/snapshots/100/metadata/200.json",
+		ExternalSpec:   `{"format":"milvus-table","extfs":{"access_key_id":"AK","access_key_value":"SK"}}`,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: common.RowIDField, Name: common.RowIDFieldName, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: common.VirtualPKFieldName, DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{FieldID: 0, Name: "id", DataType: schemapb.DataType_Int64, ExternalField: "pk"},
+			{FieldID: 0, Name: "embedding", DataType: schemapb.DataType_FloatVector, ExternalField: "vec"},
+		},
+	}
+	task := &createCollectionTask{
+		Req: &milvuspb.CreateCollectionRequest{
+			CollectionName: "target",
+			Properties: []*commonpb.KeyValuePair{
+				{Key: util.PreserveFieldIdsKey, Value: "false"},
+			},
+		},
+		body: &message.CreateCollectionRequest{
+			CollectionSchema: schema,
+		},
+	}
+
+	err := task.prepareMilvusTableSnapshotSchema(context.Background())
+	require.NoError(t, err)
+
+	assert.True(t, task.preserveFieldID)
+	require.Len(t, task.Req.GetProperties(), 1)
+	assert.Equal(t, util.PreserveFieldIdsKey, task.Req.GetProperties()[0].GetKey())
+	assert.Equal(t, "true", task.Req.GetProperties()[0].GetValue())
+	assert.Equal(t, int64(common.RowIDField), schema.GetFields()[0].GetFieldID())
+	assert.Equal(t, int64(106), schema.GetFields()[1].GetFieldID())
+	assert.Equal(t, int64(101), schema.GetFields()[2].GetFieldID())
+	assert.Equal(t, int64(105), schema.GetFields()[3].GetFieldID())
+}
+
+func TestPrepareMilvusTableSnapshotSchemaAlignsTargetFunctionOutputs(t *testing.T) {
+	mockReadMetadata := mockey.Mock(packed.ReadMilvusTableSnapshotMetadata).
+		Return(&datapb.SnapshotMetadata{
+			Collection: &datapb.CollectionDescription{
+				Schema: &schemapb.CollectionSchema{
+					Fields: []*schemapb.FieldSchema{
+						{FieldID: 101, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+						{
+							FieldID:  105,
+							Name:     "vec",
+							DataType: schemapb.DataType_FloatVector,
+							TypeParams: []*commonpb.KeyValuePair{
+								{Key: common.DimKey, Value: "16"},
+							},
+						},
+					},
+				},
+			},
+		}, nil).Build()
+	defer mockReadMetadata.UnPatch()
+
+	schema := &schemapb.CollectionSchema{
+		Name:           "target",
+		ExternalSource: "minio://localhost:9000/bucket/snapshots/100/metadata/200.json",
+		ExternalSpec:   `{"format":"milvus-table","extfs":{"access_key_id":"AK","access_key_value":"SK"}}`,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 0, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, ExternalField: "pk"},
+			{
+				FieldID:       0,
+				Name:          "embedding",
+				DataType:      schemapb.DataType_FloatVector,
+				ExternalField: "vec",
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "16"},
+				},
+			},
+			{FieldID: 101, Name: "sparse", DataType: schemapb.DataType_SparseFloatVector, IsFunctionOutput: true},
+		},
+		Functions: []*schemapb.FunctionSchema{
+			{
+				Name:             "bm25",
+				InputFieldNames:  []string{"id"},
+				OutputFieldNames: []string{"sparse"},
+			},
+		},
+	}
+	task := &createCollectionTask{
+		Req: &milvuspb.CreateCollectionRequest{
+			CollectionName: "target",
+			Properties: []*commonpb.KeyValuePair{
+				{Key: util.PreserveFieldIdsKey, Value: "false"},
+			},
+		},
+		body: &message.CreateCollectionRequest{
+			CollectionSchema: schema,
+		},
+	}
+
+	err := task.prepareMilvusTableSnapshotSchema(context.Background())
+	require.NoError(t, err)
+
+	assert.True(t, task.preserveFieldID)
+	assert.Equal(t, int64(101), schema.GetFields()[0].GetFieldID())
+	assert.Equal(t, int64(105), schema.GetFields()[1].GetFieldID())
+	assert.Equal(t, int64(106), schema.GetFields()[2].GetFieldID())
+	require.Len(t, schema.GetFunctions(), 1)
+	assert.Equal(t, int64(StartOfUserFunctionID), schema.GetFunctions()[0].GetId())
+	assert.Equal(t, []int64{101}, schema.GetFunctions()[0].GetInputFieldIds())
+	assert.Equal(t, []int64{106}, schema.GetFunctions()[0].GetOutputFieldIds())
+}
+
+func TestPrepareMilvusTableSnapshotSchemaMapsSourceFunctionOutputAsDataField(t *testing.T) {
+	mockReadMetadata := mockey.Mock(packed.ReadMilvusTableSnapshotMetadata).
+		Return(&datapb.SnapshotMetadata{
+			Collection: &datapb.CollectionDescription{
+				Schema: &schemapb.CollectionSchema{
+					Fields: []*schemapb.FieldSchema{
+						{FieldID: 101, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+						{FieldID: 105, Name: "vec", DataType: schemapb.DataType_FloatVector},
+						{
+							FieldID:          106,
+							Name:             "sparse",
+							DataType:         schemapb.DataType_SparseFloatVector,
+							IsFunctionOutput: true,
+						},
+					},
+					Functions: []*schemapb.FunctionSchema{
+						{
+							Name:             "bm25",
+							InputFieldNames:  []string{"pk"},
+							OutputFieldNames: []string{"sparse"},
+							OutputFieldIds:   []int64{106},
+						},
+					},
+				},
+			},
+		}, nil).Build()
+	defer mockReadMetadata.UnPatch()
+
+	schema := &schemapb.CollectionSchema{
+		Name:           "target",
+		ExternalSource: "minio://localhost:9000/bucket/snapshots/100/metadata/200.json",
+		ExternalSpec:   `{"format":"milvus-table","extfs":{"access_key_id":"AK","access_key_value":"SK"}}`,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 0, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, ExternalField: "pk"},
+			{FieldID: 0, Name: "embedding", DataType: schemapb.DataType_FloatVector, ExternalField: "vec"},
+			{FieldID: 0, Name: "sparse_copy", DataType: schemapb.DataType_SparseFloatVector, ExternalField: "sparse"},
+		},
+	}
+	task := &createCollectionTask{
+		Req: &milvuspb.CreateCollectionRequest{
+			CollectionName: "target",
+			Properties: []*commonpb.KeyValuePair{
+				{Key: util.PreserveFieldIdsKey, Value: "false"},
+			},
+		},
+		body: &message.CreateCollectionRequest{
+			CollectionSchema: schema,
+		},
+	}
+
+	err := task.prepareMilvusTableSnapshotSchema(context.Background())
+	require.NoError(t, err)
+
+	assert.True(t, task.preserveFieldID)
+	assert.Equal(t, int64(101), schema.GetFields()[0].GetFieldID())
+	assert.Equal(t, int64(105), schema.GetFields()[1].GetFieldID())
+	assert.Equal(t, int64(106), schema.GetFields()[2].GetFieldID())
+}
+
+func TestPrepareMilvusTableSnapshotSchemaSkipsReadWhenFieldIDsPreserved(t *testing.T) {
+	mockReadMetadata := mockey.Mock(packed.ReadMilvusTableSnapshotMetadata).
+		Return(nil, errors.New("snapshot metadata should not be read")).Build()
+	defer mockReadMetadata.UnPatch()
+
+	schema := &schemapb.CollectionSchema{
+		Name:           "target",
+		ExternalSource: "minio://localhost:9000/bucket/snapshots/100/metadata/200.json",
+		ExternalSpec:   `{"format":"milvus-table","extfs":{"access_key_id":"AK","access_key_value":"SK"}}`,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 106, Name: common.VirtualPKFieldName, DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{FieldID: 101, Name: "id", DataType: schemapb.DataType_Int64, ExternalField: "pk"},
+			{FieldID: 105, Name: "embedding", DataType: schemapb.DataType_FloatVector, ExternalField: "vec"},
+		},
+	}
+	task := &createCollectionTask{
+		Req: &milvuspb.CreateCollectionRequest{
+			CollectionName: "target",
+			Properties: []*commonpb.KeyValuePair{
+				{Key: util.PreserveFieldIdsKey, Value: "true"},
+			},
+		},
+		body: &message.CreateCollectionRequest{
+			CollectionSchema: schema,
+		},
+		preserveFieldID: true,
+	}
+
+	err := task.prepareMilvusTableSnapshotSchema(context.Background())
+	require.NoError(t, err)
+	assert.True(t, task.preserveFieldID)
+}
+
+func TestPrepareMilvusTableSnapshotSchemaErrors(t *testing.T) {
+	baseSchema := func() *schemapb.CollectionSchema {
+		return &schemapb.CollectionSchema{
+			Name:           "target",
+			ExternalSource: "minio://localhost:9000/bucket/snapshots/100/metadata/200.json",
+			ExternalSpec:   `{"format":"milvus-table","extfs":{"access_key_id":"AK","access_key_value":"SK"}}`,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 0, Name: "id", DataType: schemapb.DataType_Int64, ExternalField: "pk"},
+			},
+		}
+	}
+	baseTask := func(schema *schemapb.CollectionSchema) *createCollectionTask {
+		return &createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{CollectionName: "target"},
+			body: &message.CreateCollectionRequest{
+				CollectionSchema: schema,
+			},
+		}
+	}
+
+	t.Run("invalid source spec", func(t *testing.T) {
+		schema := baseSchema()
+		schema.ExternalSource = "file:///tmp/snapshot.json"
+		err := baseTask(schema).prepareMilvusTableSnapshotSchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "external_source scheme")
+	})
+
+	t.Run("empty source is noop", func(t *testing.T) {
+		schema := baseSchema()
+		schema.ExternalSource = ""
+		err := baseTask(schema).prepareMilvusTableSnapshotSchema(context.Background())
+		require.NoError(t, err)
+	})
+
+	t.Run("non milvus table skips snapshot read", func(t *testing.T) {
+		schema := baseSchema()
+		schema.ExternalSpec = `{"format":"parquet","extfs":{"anonymous":"true","cloud_provider":"minio"}}`
+		err := baseTask(schema).prepareMilvusTableSnapshotSchema(context.Background())
+		require.NoError(t, err)
+	})
+
+	t.Run("read metadata error", func(t *testing.T) {
+		mockReadMetadata := mockey.Mock(packed.ReadMilvusTableSnapshotMetadata).
+			Return(nil, errors.New("read failed")).Build()
+		defer mockReadMetadata.UnPatch()
+
+		err := baseTask(baseSchema()).prepareMilvusTableSnapshotSchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "read milvus-table snapshot metadata")
+	})
+
+	t.Run("missing source schema", func(t *testing.T) {
+		mockReadMetadata := mockey.Mock(packed.ReadMilvusTableSnapshotMetadata).
+			Return(&datapb.SnapshotMetadata{
+				Collection: &datapb.CollectionDescription{},
+			}, nil).Build()
+		defer mockReadMetadata.UnPatch()
+
+		err := baseTask(baseSchema()).prepareMilvusTableSnapshotSchema(context.Background())
+		require.Error(t, err)
+		assert.Equal(t, merr.Code(merr.ErrParameterInvalid), merr.Code(err))
+		assert.Contains(t, err.Error(), "missing collection schema")
+	})
+
+	t.Run("external collection snapshot is rejected", func(t *testing.T) {
+		mockReadMetadata := mockey.Mock(packed.ReadMilvusTableSnapshotMetadata).
+			Return(&datapb.SnapshotMetadata{
+				Collection: &datapb.CollectionDescription{
+					Schema: &schemapb.CollectionSchema{
+						ExternalSource: "s3://bucket/external-source",
+						ExternalSpec:   `{"format":"parquet"}`,
+						Fields: []*schemapb.FieldSchema{
+							{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, ExternalField: "pk_col"},
+						},
+					},
+				},
+			}, nil).Build()
+		defer mockReadMetadata.UnPatch()
+
+		err := baseTask(baseSchema()).prepareMilvusTableSnapshotSchema(context.Background())
+		require.Error(t, err)
+		assert.Equal(t, merr.Code(merr.ErrParameterInvalid), merr.Code(err))
+		assert.Contains(t, err.Error(), "cannot use an external collection snapshot")
+	})
+
+	t.Run("schema mismatch", func(t *testing.T) {
+		mockReadMetadata := mockey.Mock(packed.ReadMilvusTableSnapshotMetadata).
+			Return(&datapb.SnapshotMetadata{
+				Collection: &datapb.CollectionDescription{
+					Schema: &schemapb.CollectionSchema{
+						Fields: []*schemapb.FieldSchema{
+							{FieldID: 100, Name: "pk", DataType: schemapb.DataType_VarChar},
+						},
+					},
+				},
+			}, nil).Build()
+		defer mockReadMetadata.UnPatch()
+
+		err := baseTask(baseSchema()).prepareMilvusTableSnapshotSchema(context.Background())
+		require.Error(t, err)
+		assert.Equal(t, merr.Code(merr.ErrParameterInvalid), merr.Code(err))
+		assert.Contains(t, err.Error(), "target schema must match source snapshot schema")
+	})
+}
+
+func TestUpsertCreateCollectionProperty(t *testing.T) {
+	properties := upsertCreateCollectionProperty(nil, "key", "value")
+	require.Len(t, properties, 1)
+	assert.Equal(t, "value", properties[0].GetValue())
+
+	properties = upsertCreateCollectionProperty(properties, "key", "updated")
+	require.Len(t, properties, 1)
+	assert.Equal(t, "updated", properties[0].GetValue())
+}
+
 func Test_createCollectionTask_Prepare(t *testing.T) {
 	initStreamingSystemAndCore(t)
 
@@ -1750,9 +2172,110 @@ func TestCreateCollectionTask_Prepare_WithProperty(t *testing.T) {
 		task.Req.ShardsNum = common.DefaultShardsNum
 		err := task.Prepare(context.Background())
 		require.NoError(t, err)
-		assert.Len(t, task.body.CollectionSchema.Properties, 3)
+		assert.Len(t, task.body.CollectionSchema.Properties, 4)
 		assert.Equal(t, "100", common.CloneKeyValuePairs(task.body.CollectionSchema.Properties).ToMap()[common.MaxFieldIDKey])
-		assert.Len(t, task.Req.Properties, 2)
+		assert.Equal(t, "false", common.CloneKeyValuePairs(task.body.CollectionSchema.Properties).ToMap()[common.NamespaceShardingEnabledKey])
+		assert.Len(t, task.Req.Properties, 3)
+	})
+
+	t.Run("reject invalid namespace mode", func(t *testing.T) {
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).Return(&model.Database{
+			Name: "foo",
+			ID:   1,
+		}, nil).Twice()
+		meta.EXPECT().ListAllAvailCollections(mock.Anything).Return(map[int64][]int64{
+			util.DefaultDBID: {1, 2},
+		}).Once()
+		meta.EXPECT().GetGeneralCount(mock.Anything).Return(0).Once()
+		defer cleanTestEnv()
+
+		collectionName := funcutil.GenRandomStr()
+		field1 := funcutil.GenRandomStr()
+
+		ticker := newRocksMqTtSynchronizer()
+		core := newTestCore(withValidIDAllocator(), withTtSynchronizer(ticker), withMeta(meta))
+
+		schema := &schemapb.CollectionSchema{
+			Name: collectionName,
+			Fields: []*schemapb.FieldSchema{
+				{Name: field1, DataType: schemapb.DataType_Int64},
+			},
+		}
+
+		task := createCollectionTask{
+			Core: core,
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+				ShardsNum:      common.DefaultShardsNum,
+				Properties: []*commonpb.KeyValuePair{
+					{Key: common.NamespaceModeKey, Value: "invalid"},
+				},
+			},
+			header: &message.CreateCollectionMessageHeader{},
+			body: &message.CreateCollectionRequest{
+				CollectionSchema: schema,
+			},
+		}
+
+		err := task.Prepare(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid namespace.mode")
+	})
+
+	t.Run("persist valid namespace mode", func(t *testing.T) {
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.EXPECT().GetDatabaseByName(mock.Anything, mock.Anything, mock.Anything).Return(&model.Database{
+			Name: "foo",
+			ID:   1,
+		}, nil).Twice()
+		meta.EXPECT().ListAllAvailCollections(mock.Anything).Return(map[int64][]int64{
+			util.DefaultDBID: {1, 2},
+		}).Once()
+		meta.EXPECT().GetGeneralCount(mock.Anything).Return(0).Once()
+		meta.EXPECT().DescribeAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return("", errors.New("not found"))
+		meta.EXPECT().GetCollectionByName(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("not found"))
+		defer cleanTestEnv()
+
+		collectionName := funcutil.GenRandomStr()
+		field1 := funcutil.GenRandomStr()
+
+		ticker := newRocksMqTtSynchronizer()
+		core := newTestCore(withValidIDAllocator(), withTtSynchronizer(ticker), withMeta(meta))
+
+		schema := &schemapb.CollectionSchema{
+			Name:            collectionName,
+			EnableNamespace: true,
+			Fields: []*schemapb.FieldSchema{
+				{Name: field1, DataType: schemapb.DataType_Int64},
+			},
+		}
+
+		task := createCollectionTask{
+			Core: core,
+			Req: &milvuspb.CreateCollectionRequest{
+				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+				CollectionName: collectionName,
+				ShardsNum:      common.DefaultShardsNum,
+				Properties: []*commonpb.KeyValuePair{
+					{Key: common.NamespaceModeKey, Value: common.NamespaceModePartition},
+				},
+			},
+			header: &message.CreateCollectionMessageHeader{},
+			body: &message.CreateCollectionRequest{
+				CollectionSchema: schema,
+			},
+		}
+
+		err := task.Prepare(context.Background())
+		require.NoError(t, err)
+		props := common.CloneKeyValuePairs(task.body.CollectionSchema.Properties).ToMap()
+		assert.Equal(t, common.NamespaceModePartition, props[common.NamespaceModeKey])
+		assert.NotContains(t, props, common.PartitionKeyIsolationKey)
+		for _, field := range task.body.CollectionSchema.GetFields() {
+			assert.NotEqual(t, common.NamespaceFieldName, field.GetName())
+		}
 	})
 }
 
@@ -1897,6 +2420,27 @@ func TestNamespaceProperty(t *testing.T) {
 		assert.True(t, hasNamespaceField(schema))
 	})
 
+	t.Run("test namespace partition mode", func(t *testing.T) {
+		schema := initSchema()
+		task := &createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				CollectionName: collectionName,
+				Properties: []*commonpb.KeyValuePair{
+					{Key: common.NamespaceModeKey, Value: common.NamespaceModePartition},
+				},
+			},
+			header: &message.CreateCollectionMessageHeader{},
+			body: &message.CreateCollectionRequest{
+				CollectionSchema: schema,
+			},
+		}
+
+		err := task.handleNamespaceField(ctx, schema)
+		assert.NoError(t, err)
+		assert.False(t, hasNamespaceField(schema))
+		assert.False(t, hasIsolationProperty(task.Req.Properties...))
+	})
+
 	t.Run("test namespace disabled with isolation and partition key", func(t *testing.T) {
 		schema := initSchema()
 		schema.EnableNamespace = false
@@ -1975,8 +2519,29 @@ func TestNamespaceProperty(t *testing.T) {
 		assert.Error(t, err)
 	})
 
+	t.Run("test namespace partition mode", func(t *testing.T) {
+		schema := initSchema()
+		task := &createCollectionTask{
+			Req: &milvuspb.CreateCollectionRequest{
+				CollectionName: collectionName,
+				Properties: []*commonpb.KeyValuePair{
+					{Key: common.NamespaceModeKey, Value: common.NamespaceModePartition},
+				},
+			},
+			header: &message.CreateCollectionMessageHeader{},
+			body: &message.CreateCollectionRequest{
+				CollectionSchema: schema,
+			},
+		}
+
+		err := task.handleNamespaceField(ctx, schema)
+		assert.NoError(t, err)
+		assert.False(t, hasNamespaceField(schema))
+		assert.False(t, hasIsolationProperty(task.Req.Properties...))
+	})
+
 	t.Run("test namespace enabled with external collection", func(t *testing.T) {
-		// External collection is identified by having ExternalField set on fields
+		// ExternalField mapping is enough to mark this fixture as external.
 		schema := &schemapb.CollectionSchema{
 			Name:            collectionName,
 			ExternalSource:  "s3://bucket/path",

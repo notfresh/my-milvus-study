@@ -79,9 +79,12 @@ func TestComponentParam(t *testing.T) {
 		assert.Equal(t, Params.IndexSliceSize.GetAsInt64(), int64(DefaultIndexSliceSize))
 		t.Logf("knowhere index slice size = %d", Params.IndexSliceSize.GetAsInt64())
 
-		assert.InDelta(t, DefaultStreamBudgetRatio, Params.StreamBudgetRatio.GetAsFloat(), 0.0001)
-		params.Save(Params.StreamBudgetRatio.Key, "2.5")
-		assert.InDelta(t, 2.5, Params.StreamBudgetRatio.GetAsFloat(), 0.0001)
+		defer params.Reset(Params.LoadTransientBudgetBytes.Key)
+		assert.Equal(t, int64(DefaultLoadTransientBudgetBytes), Params.LoadTransientBudgetBytes.GetAsInt64())
+		params.Save(Params.LoadTransientBudgetBytes.Key, "-1")
+		assert.Equal(t, int64(DefaultLoadTransientBudgetBytes), Params.LoadTransientBudgetBytes.GetAsInt64())
+		params.Save(Params.LoadTransientBudgetBytes.Key, "67108864")
+		assert.Equal(t, int64(67108864), Params.LoadTransientBudgetBytes.GetAsInt64())
 
 		assert.Equal(t, int64(0), Params.ArrowReaderHoleSizeLimitBytes.GetAsInt64())
 		assert.Equal(t, int64(0), Params.ArrowReaderRangeSizeLimitBytes.GetAsInt64())
@@ -236,6 +239,7 @@ func TestComponentParam(t *testing.T) {
 		t.Logf("MsgStreamTimeTickBufSize: %d", Params.MsgStreamTimeTickBufSize.GetAsInt64())
 
 		t.Logf("MaxNameLength: %d", Params.MaxNameLength.GetAsInt64())
+		assert.Equal(t, 1024, Params.MaxUserDescriptionLength.GetAsInt())
 
 		t.Logf("MaxFieldNum: %d", Params.MaxFieldNum.GetAsInt64())
 
@@ -309,6 +313,14 @@ func TestComponentParam(t *testing.T) {
 		assert.Equal(t, 72, Params.MaxPasswordLength.GetAsInt())
 		params.Save("proxy.maxPasswordLength", "-10")
 		assert.Equal(t, 72, Params.MaxPasswordLength.GetAsInt())
+
+		assert.Equal(t, int64(4096), Params.MaxArrayCapacity.GetAsInt64())
+		params.Save("proxy.maxArrayCapacity", "5000")
+		assert.Equal(t, int64(5000), Params.MaxArrayCapacity.GetAsInt64())
+		params.Save("proxy.maxArrayCapacity", "0")
+		assert.Equal(t, int64(4096), Params.MaxArrayCapacity.GetAsInt64())
+		params.Save("proxy.maxArrayCapacity", "-1")
+		assert.Equal(t, int64(4096), Params.MaxArrayCapacity.GetAsInt64())
 	})
 
 	// t.Run("test proxyConfig panic", func(t *testing.T) {
@@ -437,7 +449,8 @@ func TestComponentParam(t *testing.T) {
 		assert.Equal(t, 100*time.Second, Params.GracefulStopTimeout.GetAsDuration(time.Second))
 		assert.Equal(t, true, Params.EnableStoppingBalance.GetAsBool())
 
-		assert.Equal(t, 4, Params.ChannelExclusiveNodeFactor.GetAsInt())
+		assert.Equal(t, "ChannelLevelScoreBalancer", Params.Balancer.GetValue())
+		assert.Equal(t, 3, Params.ChannelExclusiveNodeFactor.GetAsInt())
 
 		assert.Equal(t, 200, Params.CollectionObserverInterval.GetAsInt())
 		params.Save("queryCoord.collectionObserverInterval", "100")
@@ -450,6 +463,7 @@ func TestComponentParam(t *testing.T) {
 
 		assert.Equal(t, 0, Params.ClusterLevelLoadReplicaNumber.GetAsInt())
 		assert.Len(t, Params.ClusterLevelLoadResourceGroups.GetAsStrings(), 0)
+		assert.False(t, Params.ClusterLevelLoadForceOverrideUserReplicaMode.GetAsBool())
 
 		assert.Equal(t, 10, Params.CollectionChannelCountFactor.GetAsInt())
 		assert.Equal(t, 3000, Params.AutoBalanceInterval.GetAsInt())
@@ -476,13 +490,17 @@ func TestComponentParam(t *testing.T) {
 		length := Params.FlowGraphMaxQueueLength.GetAsInt32()
 		assert.Equal(t, int32(16), length)
 
+		assert.Equal(t, 8, Params.DMLMicroBatchMaxMsgNum.GetAsInt())
+		params.Save(Params.DMLMicroBatchMaxMsgNum.Key, "4")
+		assert.Equal(t, 4, Params.DMLMicroBatchMaxMsgNum.GetAsInt())
+		params.Reset(Params.DMLMicroBatchMaxMsgNum.Key)
+
 		maxParallelism := Params.FlowGraphMaxParallelism.GetAsInt32()
 		assert.Equal(t, int32(1024), maxParallelism)
 
 		// test query side config
 		chunkRows := Params.ChunkRows.GetAsInt64()
 		assert.Equal(t, int64(128), chunkRows)
-
 		nlist := Params.InterimIndexNlist.GetAsInt64()
 		assert.Equal(t, int64(128), nlist)
 
@@ -491,8 +509,9 @@ func TestComponentParam(t *testing.T) {
 
 		assert.Equal(t, int32(1024), Params.MaxUnsolvedQueueSize.GetAsInt32())
 		assert.Equal(t, "1024", Params.MaxUnsolvedQueueSize.DefaultValue)
-		assert.Equal(t, int64(16), Params.MaxGroupNQ.GetAsInt64())
-		assert.Equal(t, 3.0, Params.NQMergeRatio.GetAsFloat())
+		assert.Equal(t, int64(64), Params.MaxGroupNQ.GetAsInt64())
+		assert.Equal(t, 16.0, Params.NQMergeRatio.GetAsFloat())
+		assert.Equal(t, 20.0, Params.TopKMergeRatio.GetAsFloat())
 		assert.Equal(t, 50*time.Millisecond, Params.MaxDeadlineMergeGap.GetAsDurationByParse())
 		defer params.Reset(Params.MaxDeadlineMergeGap.Key)
 		assert.NoError(t, params.Save(Params.MaxDeadlineMergeGap.Key, "100ms"))

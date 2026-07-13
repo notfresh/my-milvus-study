@@ -277,6 +277,88 @@ TEST_F(DiskAnnFileManagerTest, ReadAndWriteWithStream) {
     lcm->Remove(small_index_file_path);
 }
 
+TEST_F(DiskAnnFileManagerTest, OpenInputStreamUsesBasenameForIndexPath) {
+    auto conf = milvus_storage::ArrowFileSystemConfig();
+    conf.storage_type = "local";
+    conf.root_path = TestLocalPath + "diskann_stream_contract";
+
+    auto result = milvus_storage::CreateArrowFileSystem(conf);
+    ASSERT_TRUE(result.ok());
+    auto fs = result.ValueOrDie();
+
+    FieldDataMeta field_meta;
+    field_meta.collection_id = 100;
+    field_meta.partition_id = 20;
+    field_meta.segment_id = 30;
+    field_meta.field_id = 5;
+
+    IndexMeta index_meta;
+    index_meta.segment_id = 30;
+    index_meta.field_id = 5;
+    index_meta.build_id = 1000;
+    index_meta.index_version = 1;
+    index_meta.index_store_path_version = milvus::proto::index::
+        IndexStorePathVersion::INDEX_STORE_PATH_VERSION_COLLECTION_ROOTED;
+
+    auto fm = std::make_shared<DiskFileManagerImpl>(
+        storage::FileManagerContext(field_meta, index_meta, cm_, fs));
+
+    const std::string local_path =
+        fm->GetLocalIndexObjectPrefix() + "index_data";
+    auto output = fm->OpenOutputStream(local_path);
+    const uint64_t expected = 0x1020304050607080ULL;
+    output->Write(expected);
+    output->Close();
+
+    auto input = fm->OpenInputStream("index_v1/100/20/30/1000/1/index_data");
+    uint64_t actual = 0;
+    input->Read(actual);
+    EXPECT_EQ(actual, expected);
+
+    boost::filesystem::remove_all(conf.root_path);
+}
+
+TEST_F(DiskAnnFileManagerTest, OpenInputStreamDoesNotUseRemoteParentPath) {
+    auto conf = milvus_storage::ArrowFileSystemConfig();
+    conf.storage_type = "local";
+    conf.root_path = TestLocalPath + "diskann_stream_no_direct";
+
+    auto result = milvus_storage::CreateArrowFileSystem(conf);
+    ASSERT_TRUE(result.ok());
+    auto fs = result.ValueOrDie();
+
+    FieldDataMeta field_meta;
+    field_meta.collection_id = 100;
+    field_meta.partition_id = 20;
+    field_meta.segment_id = 30;
+    field_meta.field_id = 5;
+
+    IndexMeta index_meta;
+    index_meta.segment_id = 30;
+    index_meta.field_id = 5;
+    index_meta.build_id = 1000;
+    index_meta.index_version = 1;
+    index_meta.index_store_path_version = milvus::proto::index::
+        IndexStorePathVersion::INDEX_STORE_PATH_VERSION_COLLECTION_ROOTED;
+
+    auto fm = std::make_shared<DiskFileManagerImpl>(
+        storage::FileManagerContext(field_meta, index_meta, cm_, fs));
+
+    const std::string local_path =
+        fm->GetLocalIndexObjectPrefix() + "index_data";
+    auto output = fm->OpenOutputStream(local_path);
+    const uint64_t expected = 42;
+    output->Write(expected);
+    output->Close();
+
+    auto input = fm->OpenInputStream("wrong_parent/path/index_data");
+    uint64_t actual = 0;
+    input->Read(actual);
+    EXPECT_EQ(actual, expected);
+
+    boost::filesystem::remove_all(conf.root_path);
+}
+
 TEST_F(DiskAnnFileManagerTest, GetRemoteIndexObjectPrefix_V0BuildRooted) {
     storage::FieldDataMeta field_meta;
     field_meta.collection_id = 100;
@@ -458,6 +540,20 @@ const int64_t kOptFieldDataRange = 1000;
 const size_t kEntityCnt = 1000 * 10;
 const FieldDataMeta kOptVecFieldDataMeta = {1, 2, 3, 100};
 using OffsetT = uint32_t;
+
+auto
+StripTrailingPathSeparators(std::string path) -> std::string {
+    auto is_path_separator = [](char c) { return c == '/' || c == '\\'; };
+    while (!path.empty() && is_path_separator(path.back())) {
+        path.pop_back();
+    }
+    return path;
+}
+
+auto
+StartsWith(const std::string& value, const std::string& prefix) -> bool {
+    return value.rfind(prefix, 0) == 0;
+}
 
 auto
 CreateFileManager(const ChunkManagerPtr& cm,
@@ -1128,6 +1224,246 @@ TEST_F(DiskAnnFileManagerTest, CacheRawDataToDiskNullableVector) {
             cm_->Remove(insert_file_path);
         }
     }
+}
+
+TEST_F(DiskAnnFileManagerTest, LocalPathGenerationIsPerFileManager) {
+    auto fm1 = CreateFileManager(cm_, fs_);
+    auto fm2 = CreateFileManager(cm_, fs_);
+
+    EXPECT_NE(fm1->GetLocalIndexObjectPrefix(),
+              fm2->GetLocalIndexObjectPrefix());
+    EXPECT_NE(fm1->GetLocalTempIndexObjectPrefix(),
+              fm2->GetLocalTempIndexObjectPrefix());
+    EXPECT_NE(fm1->GetLocalTextIndexPrefix(), fm2->GetLocalTextIndexPrefix());
+    EXPECT_NE(fm1->GetLocalTempTextIndexPrefix(),
+              fm2->GetLocalTempTextIndexPrefix());
+    EXPECT_NE(fm1->GetLocalJsonStatsPrefix(), fm2->GetLocalJsonStatsPrefix());
+    EXPECT_NE(fm1->GetLocalTempJsonStatsPrefix(),
+              fm2->GetLocalTempJsonStatsPrefix());
+    EXPECT_NE(fm1->GetLocalNgramIndexPrefix(), fm2->GetLocalNgramIndexPrefix());
+    EXPECT_NE(fm1->GetLocalTempNgramIndexPrefix(),
+              fm2->GetLocalTempNgramIndexPrefix());
+    EXPECT_NE(fm1->GetLocalRawDataObjectPrefix(),
+              fm2->GetLocalRawDataObjectPrefix());
+
+    EXPECT_EQ(fm1->GetRemoteIndexObjectPrefix(),
+              fm2->GetRemoteIndexObjectPrefix());
+    EXPECT_EQ(fm1->GetRemoteTextLogPrefix(), fm2->GetRemoteTextLogPrefix());
+}
+
+TEST_F(DiskAnnFileManagerTest, LocalPathGenerationUsesLeafFolderName) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    auto file_manager = CreateFileManager(cm_, fs_);
+    auto generated_prefix = file_manager->GetLocalIndexObjectPrefix();
+    auto legacy_prefix = GenIndexPathPrefix(local_chunk_manager,
+                                            1000,
+                                            1,
+                                            kOptVecFieldDataMeta.segment_id,
+                                            kOptVecFieldDataMeta.field_id,
+                                            false);
+
+    auto generated_path =
+        boost::filesystem::path(StripTrailingPathSeparators(generated_prefix));
+    auto legacy_path =
+        boost::filesystem::path(StripTrailingPathSeparators(legacy_prefix));
+
+    EXPECT_EQ(generated_path.parent_path(), legacy_path.parent_path());
+    EXPECT_TRUE(StartsWith(generated_path.filename().string(),
+                           legacy_path.filename().string() + "_"));
+    EXPECT_FALSE(StartsWith(generated_prefix, legacy_prefix));
+
+    auto legacy_file = legacy_prefix + "old_generation/index_data";
+    auto generated_file = generated_prefix + "index_data";
+    local_chunk_manager->CreateFile(legacy_file);
+    local_chunk_manager->CreateFile(generated_file);
+    ASSERT_TRUE(local_chunk_manager->Exist(legacy_file));
+    ASSERT_TRUE(local_chunk_manager->Exist(generated_file));
+
+    local_chunk_manager->RemoveDir(legacy_prefix);
+    EXPECT_FALSE(local_chunk_manager->Exist(legacy_file));
+    EXPECT_TRUE(local_chunk_manager->Exist(generated_file));
+}
+
+TEST_F(DiskAnnFileManagerTest, FileCleanupKeepsOtherGeneration) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+
+    std::string fm1_file;
+    std::string fm2_file;
+    {
+        auto fm1 = CreateFileManager(cm_, fs_);
+        auto fm2 = CreateFileManager(cm_, fs_);
+        fm1_file = fm1->GetLocalIndexObjectPrefix() + "index_data";
+        fm2_file = fm2->GetLocalIndexObjectPrefix() + "index_data";
+
+        local_chunk_manager->CreateFile(fm1_file);
+        local_chunk_manager->CreateFile(fm2_file);
+        EXPECT_TRUE(local_chunk_manager->Exist(fm1_file));
+        EXPECT_TRUE(local_chunk_manager->Exist(fm2_file));
+
+        fm1.reset();
+        EXPECT_FALSE(local_chunk_manager->Exist(fm1_file));
+        EXPECT_TRUE(local_chunk_manager->Exist(fm2_file));
+    }
+
+    EXPECT_FALSE(local_chunk_manager->Exist(fm2_file));
+}
+
+TEST_F(DiskAnnFileManagerTest,
+       FileCleanupKeepsOtherGenerationAcrossAllLocalPrefixes) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+
+    std::vector<std::string> fm2_files;
+    {
+        auto fm1 = CreateFileManager(cm_, fs_);
+        auto fm2 = CreateFileManager(cm_, fs_);
+
+        const std::vector<std::pair<std::string, std::string>> fm1_files = {
+            {fm1->GetLocalIndexObjectPrefix() + "index_data",
+             fm2->GetLocalIndexObjectPrefix() + "index_data"},
+            {fm1->GetLocalTextIndexPrefix() + "text_log_data",
+             fm2->GetLocalTextIndexPrefix() + "text_log_data"},
+            {fm1->GetLocalJsonStatsSharedIndexPrefix() + "shared_index_data",
+             fm2->GetLocalJsonStatsSharedIndexPrefix() + "shared_index_data"},
+            {fm1->GetLocalJsonStatsPrefix() + "meta.json",
+             fm2->GetLocalJsonStatsPrefix() + "meta.json"},
+            {fm1->GetLocalNgramIndexPrefix() + "ngram_index_data",
+             fm2->GetLocalNgramIndexPrefix() + "ngram_index_data"},
+            {fm1->GetLocalRawDataObjectPrefix() + "raw_data",
+             fm2->GetLocalRawDataObjectPrefix() + "raw_data"},
+        };
+
+        for (const auto& [fm1_file, fm2_file] : fm1_files) {
+            local_chunk_manager->CreateFile(fm1_file);
+            local_chunk_manager->CreateFile(fm2_file);
+            ASSERT_TRUE(local_chunk_manager->Exist(fm1_file));
+            ASSERT_TRUE(local_chunk_manager->Exist(fm2_file));
+            fm2_files.push_back(fm2_file);
+        }
+
+        fm1.reset();
+        for (const auto& [fm1_file, fm2_file] : fm1_files) {
+            EXPECT_FALSE(local_chunk_manager->Exist(fm1_file));
+            EXPECT_TRUE(local_chunk_manager->Exist(fm2_file));
+        }
+    }
+
+    for (const auto& fm2_file : fm2_files) {
+        EXPECT_FALSE(local_chunk_manager->Exist(fm2_file));
+    }
+}
+
+TEST_F(DiskAnnFileManagerTest, DirectoryLeaseDefersCleanupUntilRelease) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    auto file_manager = CreateFileManager(cm_, fs_);
+    auto local_index_prefix = file_manager->GetLocalIndexObjectPrefix();
+    auto local_index_file = local_index_prefix + "index_data";
+
+    {
+        auto lease =
+            file_manager->AcquireLocalDirWriteLease(local_index_prefix);
+        ASSERT_TRUE(lease);
+        local_chunk_manager->CreateFile(local_index_file);
+        ASSERT_TRUE(local_chunk_manager->Exist(local_index_file));
+
+        file_manager->RemoveIndexFiles();
+        EXPECT_TRUE(local_chunk_manager->Exist(local_index_file));
+    }
+
+    EXPECT_FALSE(local_chunk_manager->Exist(local_index_file));
+}
+
+TEST_F(DiskAnnFileManagerTest, RawDataDirectoryLeaseDefersCleanupUntilRelease) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    auto file_manager = CreateFileManager(cm_, fs_);
+    auto local_raw_data_prefix = file_manager->GetLocalRawDataObjectPrefix();
+    auto local_raw_data_file = local_raw_data_prefix + "raw_data";
+
+    {
+        auto lease =
+            file_manager->AcquireLocalDirWriteLease(local_raw_data_prefix);
+        ASSERT_TRUE(lease);
+        local_chunk_manager->CreateFile(local_raw_data_file);
+        ASSERT_TRUE(local_chunk_manager->Exist(local_raw_data_file));
+
+        file_manager->RemoveRawDataFiles();
+        EXPECT_TRUE(local_chunk_manager->Exist(local_raw_data_file));
+    }
+
+    EXPECT_FALSE(local_chunk_manager->Exist(local_raw_data_file));
+}
+
+TEST_F(DiskAnnFileManagerTest, DirectoryLeaseRejectsNewWritersAfterCleanup) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    auto file_manager = CreateFileManager(cm_, fs_);
+    auto local_index_prefix = file_manager->GetLocalIndexObjectPrefix();
+    auto local_index_file = local_index_prefix + "index_data";
+
+    {
+        auto lease =
+            file_manager->AcquireLocalDirWriteLease(local_index_prefix);
+        ASSERT_TRUE(lease);
+        local_chunk_manager->CreateFile(local_index_file);
+        ASSERT_TRUE(local_chunk_manager->Exist(local_index_file));
+
+        file_manager->RemoveIndexFiles();
+        EXPECT_THROW(
+            {
+                auto blocked =
+                    file_manager->AcquireLocalDirWriteLease(local_index_prefix);
+                (void)blocked;
+            },
+            SegcoreError);
+    }
+
+    EXPECT_THROW(
+        {
+            auto blocked =
+                file_manager->AcquireLocalDirWriteLease(local_index_prefix);
+            (void)blocked;
+        },
+        SegcoreError);
+    EXPECT_FALSE(local_chunk_manager->Exist(local_index_file));
+}
+
+TEST_F(DiskAnnFileManagerTest,
+       RawDataDirectoryLeaseRejectsNewWritersAfterCleanup) {
+    auto local_chunk_manager =
+        LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    auto file_manager = CreateFileManager(cm_, fs_);
+    auto local_raw_data_prefix = file_manager->GetLocalRawDataObjectPrefix();
+    auto local_raw_data_file = local_raw_data_prefix + "raw_data";
+
+    {
+        auto lease =
+            file_manager->AcquireLocalDirWriteLease(local_raw_data_prefix);
+        ASSERT_TRUE(lease);
+        local_chunk_manager->CreateFile(local_raw_data_file);
+        ASSERT_TRUE(local_chunk_manager->Exist(local_raw_data_file));
+
+        file_manager->RemoveRawDataFiles();
+        EXPECT_THROW(
+            {
+                auto blocked = file_manager->AcquireLocalDirWriteLease(
+                    local_raw_data_prefix);
+                (void)blocked;
+            },
+            SegcoreError);
+    }
+
+    EXPECT_THROW(
+        {
+            auto blocked =
+                file_manager->AcquireLocalDirWriteLease(local_raw_data_prefix);
+            (void)blocked;
+        },
+        SegcoreError);
+    EXPECT_FALSE(local_chunk_manager->Exist(local_raw_data_file));
 }
 
 TEST_F(DiskAnnFileManagerTest, FileCleanup) {

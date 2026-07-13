@@ -643,7 +643,7 @@ class TestRegexFilterFieldAccess(RegexFilterSharedWideBase):
     def test_regex_on_json_nested_path(self):
         """
         target: verify regex and !~ on nested JSON string paths
-        expected: metadata["nested"]["x"] =~ "^abc$" -> [1], !~ "^abc$" -> [2,3,4,5,6,7]
+        expected: metadata["nested"]["x"] =~ "^abc$" -> [1], !~ "^abc$" -> [2,3,4,5,7]
         """
         client, collection_name = self._shared_collection()
 
@@ -653,7 +653,7 @@ class TestRegexFilterFieldAccess(RegexFilterSharedWideBase):
 
         res = client.query(collection_name, filter='metadata["nested"]["x"] !~ "^abc$"', output_fields=["id"])
         result = sorted([r["id"] for r in res])
-        assert result == [2, 3, 4, 5, 6, 7], f'nested !~ "^abc$": expected [2,3,4,5,6,7], got {result}'
+        assert result == [2, 3, 4, 5, 7], f'nested !~ "^abc$": expected [2,3,4,5,7], got {result}'
 
         res = client.query(collection_name, filter='metadata["nested"]["missing"] =~ ".*"', output_fields=["id"])
         assert res == [], f"missing nested key: expected [], got {res}"
@@ -805,7 +805,7 @@ class TestRegexFilterFieldAccess(RegexFilterSharedWideBase):
     def test_regex_array_element_negation(self):
         """
         target: verify !~ on ARRAY<VARCHAR> element paths
-        expected: tags[0] !~ "^release" -> [3,4,6,7], out-of-range !~ includes all rows
+        expected: tags[0] !~ "^release" -> [3,4,6,7], out-of-range !~ is UNKNOWN and excluded
         """
         client, collection_name = self._shared_collection()
 
@@ -815,7 +815,7 @@ class TestRegexFilterFieldAccess(RegexFilterSharedWideBase):
 
         res = client.query(collection_name, filter='tags[10] !~ ".*"', output_fields=["id"])
         result = sorted([r["id"] for r in res])
-        assert result == [1, 2, 3, 4, 5, 6, 7], f"out-of-range !~: expected all rows, got {result}"
+        assert result == [], f"out-of-range !~: expected [], got {result}"
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_regex_dynamic_json_field_paths(self):
@@ -846,7 +846,7 @@ class TestRegexFilterFieldAccess(RegexFilterSharedWideBase):
 
         res = client.query(collection_name, filter='$meta["dyn_text"] !~ "ERROR"', output_fields=["id"])
         result = sorted([r["id"] for r in res])
-        assert result == [2, 3], f"dynamic dyn_text !~ ERROR expected [2,3], got {result}"
+        assert result == [2], f"dynamic dyn_text !~ ERROR expected [2], got {result}"
 
         res = client.query(collection_name, filter='$meta["dyn_num"] =~ "10"', output_fields=["id"])
         assert res == [], f"dynamic non-string regex expected [], got {res}"
@@ -1813,7 +1813,7 @@ class TestRegexFilterQuerySearch(RegexFilterSharedWideBase):
             ('email !~ "gmail"', {2, 3, 7}),
             ('email !~ "gmail" or email is null', {2, 3, 4, 7}),
             ('metadata["version"] =~ "^v[0-9]+\\.[0-9]+$"', {1, 2, 3, 5, 7}),
-            ('metadata["nested"]["x"] !~ "^abc$"', {2, 3, 4, 5, 6, 7}),
+            ('metadata["nested"]["x"] !~ "^abc$"', {2, 3, 4, 5, 7}),
         ]:
             res = client.search(
                 collection_name=collection_name,
@@ -2419,7 +2419,6 @@ class TestRegexFilterStructArray(RegexFilterStructArraySharedBase):
         )
 
     @pytest.mark.tags(CaseLabel.L1)
-    @pytest.mark.xfail(reason="nullable StructArray None insert is not merged into master yet", strict=True)
     def test_regex_struct_array_nullable_null_field_query(self):
         """
         target: regex filtering excludes null StructArray fields when nullable StructArray insert is supported

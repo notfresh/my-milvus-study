@@ -1181,6 +1181,10 @@ func (coord *MixCoordMock) CreateRole(ctx context.Context, req *milvuspb.CreateR
 	return &commonpb.Status{}, nil
 }
 
+func (coord *MixCoordMock) AlterRole(ctx context.Context, req *milvuspb.AlterRoleRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, nil
+}
+
 func (coord *MixCoordMock) DropRole(ctx context.Context, req *milvuspb.DropRoleRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
@@ -1719,6 +1723,13 @@ func (coord *MixCoordMock) RestoreSnapshot(ctx context.Context, req *datapb.Rest
 	return &datapb.RestoreSnapshotResponse{
 		Status: merr.Success(),
 		JobId:  1,
+	}, nil
+}
+
+func (coord *MixCoordMock) ExportSnapshot(ctx context.Context, req *datapb.ExportSnapshotRequest, opts ...grpc.CallOption) (*datapb.ExportSnapshotResponse, error) {
+	return &datapb.ExportSnapshotResponse{
+		Status:              merr.Success(),
+		SnapshotMetadataUri: req.GetTargetS3Path() + "/snapshots/100/metadata/1.json",
 	}, nil
 }
 

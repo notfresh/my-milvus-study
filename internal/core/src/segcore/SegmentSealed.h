@@ -56,11 +56,6 @@ class SegmentSealed : public SegmentInternalInterface {
                const int64_t* ids,
                int64_t count) const = 0;
 
-    virtual void
-    LoadTextIndex(milvus::OpContext* op_ctx,
-                  std::shared_ptr<milvus::proto::indexcgo::LoadTextIndexInfo>
-                      info_proto) = 0;
-
     virtual InsertRecord<true>&
     get_insert_record() = 0;
 
@@ -178,12 +173,6 @@ class SegmentSealed : public SegmentInternalInterface {
     GetNgramIndexForJson(milvus::OpContext* op_ctx,
                          FieldId field_id,
                          const std::string& nested_path) const override = 0;
-    virtual void
-    LoadJsonStats(FieldId field_id,
-                  std::shared_ptr<index::JsonKeyStats> stats) = 0;
-
-    virtual void
-    RemoveJsonStats(FieldId field_id) = 0;
 
     SegmentType
     type() const override {

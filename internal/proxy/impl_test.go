@@ -31,8 +31,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
@@ -45,6 +47,7 @@ import (
 	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
 	"github.com/milvus-io/milvus/internal/proxy/shardclient"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
@@ -55,6 +58,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	pulsar2 "github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/pulsar"
+	"github.com/milvus-io/milvus/pkg/v3/util"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/ratelimitutil"
@@ -178,6 +182,86 @@ func TestProxy_CheckHealth(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, true, resp.IsHealthy)
 	})
+}
+
+func TestProxyRoleDescriptionValidation(t *testing.T) {
+	paramtable.Init()
+	node := &Proxy{mixCoord: NewMixCoordMock()}
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
+	ctx := context.Background()
+
+	paramtable.Get().Save(Params.ProxyCfg.MaxRoleDescriptionLength.Key, "4")
+	defer paramtable.Get().Reset(Params.ProxyCfg.MaxRoleDescriptionLength.Key)
+
+	status, err := node.CreateRole(ctx, &milvuspb.CreateRoleRequest{
+		Entity: &milvuspb.RoleEntity{
+			Name:        "role_desc",
+			Description: "12345",
+		},
+	})
+	require.NoError(t, err)
+	assert.NotEqual(t, commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	status, err = node.AlterRole(ctx, &milvuspb.AlterRoleRequest{
+		RoleName:    "role_desc",
+		Description: "12345",
+	})
+	require.NoError(t, err)
+	assert.NotEqual(t, commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	status, err = node.AlterRole(ctx, &milvuspb.AlterRoleRequest{
+		RoleName:    util.RoleAdmin,
+		Description: "ok",
+	})
+	require.NoError(t, err)
+	assert.NotEqual(t, commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	status, err = node.RestoreRBAC(ctx, &milvuspb.RestoreRBACMetaRequest{
+		RBACMeta: &milvuspb.RBACMeta{
+			Roles: []*milvuspb.RoleEntity{
+				{
+					Name:        "role_desc",
+					Description: "12345",
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	assert.NotEqual(t, commonpb.ErrorCode_Success, status.GetErrorCode())
+}
+
+func TestProxyRoleDescriptionForwarding(t *testing.T) {
+	paramtable.Init()
+	mixCoord := mocks.NewMockMixCoordClient(t)
+	node := &Proxy{mixCoord: mixCoord}
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
+	ctx := context.Background()
+
+	mixCoord.EXPECT().CreateRole(mock.Anything, mock.MatchedBy(func(req *milvuspb.CreateRoleRequest) bool {
+		return req.GetBase().GetMsgType() == commonpb.MsgType_CreateRole &&
+			req.GetEntity().GetName() == "role_desc_forward" &&
+			req.GetEntity().GetDescription() == "role description"
+	})).Return(merr.Success(), nil).Once()
+	status, err := node.CreateRole(ctx, &milvuspb.CreateRoleRequest{
+		Entity: &milvuspb.RoleEntity{
+			Name:        "role_desc_forward",
+			Description: "role description",
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, merr.Ok(status))
+
+	mixCoord.EXPECT().AlterRole(mock.Anything, mock.MatchedBy(func(req *milvuspb.AlterRoleRequest) bool {
+		return req.GetBase().GetMsgType() == commonpb.MsgType_AlterRole &&
+			req.GetRoleName() == "role_desc_forward" &&
+			req.GetDescription() == "updated role description"
+	})).Return(merr.Success(), nil).Once()
+	status, err = node.AlterRole(ctx, &milvuspb.AlterRoleRequest{
+		RoleName:    "role_desc_forward",
+		Description: "updated role description",
+	})
+	require.NoError(t, err)
+	require.True(t, merr.Ok(status))
 }
 
 func TestProxyRenameCollection(t *testing.T) {
@@ -2125,6 +2209,88 @@ func TestHandleIfSearchByPK_BM25Detection(t *testing.T) {
 	})
 }
 
+func TestHandleIfSearchByPK_PreservesNamespaceInInternalQuery(t *testing.T) {
+	mockey.PatchConvey("TestHandleIfSearchByPK_PreservesNamespaceInInternalQuery", t, func() {
+		paramtable.Init()
+		originalCache := globalMetaCache
+		defer func() { globalMetaCache = originalCache }()
+
+		namespace := "tenant_a"
+		schema := &schemapb.CollectionSchema{
+			Name:            "test_collection",
+			EnableNamespace: true,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{
+					FieldID:    101,
+					Name:       "vec",
+					DataType:   schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "2"}},
+				},
+			},
+		}
+
+		cache := NewMockCache(t)
+		cache.EXPECT().
+			GetCollectionInfo(mock.Anything, "default", "test_collection", int64(0)).
+			Return(&collectionInfo{schema: newSchemaInfo(schema)}, nil)
+		globalMetaCache = cache
+
+		var capturedNamespace *string
+		mockey.Mock((*Proxy).query).To(func(_ *Proxy, _ context.Context, qt *queryTask, _ trace.Span) (*milvuspb.QueryResults, segcore.StorageCost, error) {
+			capturedNamespace = qt.request.Namespace
+			return &milvuspb.QueryResults{
+				Status: merr.Success(),
+				FieldsData: []*schemapb.FieldData{
+					{
+						FieldName: "id",
+						FieldId:   100,
+						Type:      schemapb.DataType_Int64,
+						Field: &schemapb.FieldData_Scalars{
+							Scalars: &schemapb.ScalarField{
+								Data: &schemapb.ScalarField_LongData{
+									LongData: &schemapb.LongArray{Data: []int64{1}},
+								},
+							},
+						},
+					},
+					{
+						FieldName: "vec",
+						FieldId:   101,
+						Type:      schemapb.DataType_FloatVector,
+						Field: &schemapb.FieldData_Vectors{
+							Vectors: &schemapb.VectorField{
+								Dim: 2,
+								Data: &schemapb.VectorField_FloatVector{
+									FloatVector: &schemapb.FloatArray{Data: []float32{0.1, 0.2}},
+								},
+							},
+						},
+					},
+				},
+			}, segcore.StorageCost{}, nil
+		}).Build()
+
+		node := &Proxy{}
+		req := &milvuspb.SearchRequest{
+			DbName:         "default",
+			CollectionName: "test_collection",
+			Namespace:      &namespace,
+			SearchInput: &milvuspb.SearchRequest_Ids{
+				Ids: &schemapb.IDs{
+					IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{1}}},
+				},
+			},
+			SearchParams: []*commonpb.KeyValuePair{{Key: AnnsFieldKey, Value: "vec"}},
+		}
+
+		_, err := node.handleIfSearchByPK(context.Background(), req)
+		assert.NoError(t, err)
+		require.NotNil(t, capturedNamespace)
+		assert.Equal(t, namespace, *capturedNamespace)
+	})
+}
+
 func TestProxy_ManualCompaction_ExternalCollection(t *testing.T) {
 	// Save and restore globalMetaCache
 	cache := globalMetaCache
@@ -2401,6 +2567,120 @@ func TestProxy_AddCollectionField_ExternalCollection(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.True(t, merr.Ok(resp))
+}
+
+func TestProxy_AddCollectionField_TextValidation(t *testing.T) {
+	baseSchema := &schemapb.CollectionSchema{
+		Name: "test_coll",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{
+				FieldID:    101,
+				Name:       "vec",
+				DataType:   schemapb.DataType_FloatVector,
+				TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "128"}},
+			},
+		},
+	}
+
+	for _, tc := range []struct {
+		name        string
+		storageV3   string
+		field       *schemapb.FieldSchema
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:      "text nullable allowed when storage v3 enabled",
+			storageV3: "true",
+			field: &schemapb.FieldSchema{
+				Name:     "text_field",
+				DataType: schemapb.DataType_Text,
+				Nullable: true,
+			},
+		},
+		{
+			name:      "text requires storage v3",
+			storageV3: "false",
+			field: &schemapb.FieldSchema{
+				Name:     "text_field",
+				DataType: schemapb.DataType_Text,
+				Nullable: true,
+			},
+			wantErr:     true,
+			errContains: "TEXT field requires StorageV3",
+		},
+		{
+			name:      "text must be nullable",
+			storageV3: "true",
+			field: &schemapb.FieldSchema{
+				Name:     "text_not_nullable",
+				DataType: schemapb.DataType_Text,
+				Nullable: false,
+			},
+			wantErr:     true,
+			errContains: "added field must be nullable",
+		},
+		{
+			name:      "text default value rejected",
+			storageV3: "true",
+			field: &schemapb.FieldSchema{
+				Name:     "text_default",
+				DataType: schemapb.DataType_Text,
+				Nullable: true,
+				DefaultValue: &schemapb.ValueField{
+					Data: &schemapb.ValueField_StringData{StringData: "default text"},
+				},
+			},
+			wantErr:     true,
+			errContains: "default value is not supported when adding TEXT field",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paramtable.Get().Save(paramtable.Get().CommonCfg.UseLoonFFI.Key, tc.storageV3)
+			t.Cleanup(func() {
+				paramtable.Get().Reset(paramtable.Get().CommonCfg.UseLoonFFI.Key)
+			})
+
+			node := createTestProxy()
+			defer node.sched.Close()
+
+			mockDescribe := mockey.Mock((*Proxy).DescribeCollection).Return(&milvuspb.DescribeCollectionResponse{
+				Status: merr.Success(),
+				Schema: proto.Clone(baseSchema).(*schemapb.CollectionSchema),
+			}, nil).Build()
+			defer mockDescribe.UnPatch()
+
+			mockEnqueue := mockey.Mock((*ddTaskQueue).Enqueue).To(func(_ *ddTaskQueue, queued task) error {
+				require.NoError(t, queued.OnEnqueue())
+				addTask := queued.(*addCollectionFieldTask)
+				err := addTask.PreExecute(context.Background())
+				if err != nil {
+					addTask.result = merr.Status(err)
+				} else {
+					addTask.result = merr.Success()
+				}
+				addTask.Notify(err)
+				return nil
+			}).Build()
+			defer mockEnqueue.UnPatch()
+
+			fieldBytes, err := proto.Marshal(tc.field)
+			require.NoError(t, err)
+			resp, err := node.AddCollectionField(context.Background(), &milvuspb.AddCollectionFieldRequest{
+				DbName:         "default",
+				CollectionName: "test_coll",
+				Schema:         fieldBytes,
+			})
+			require.NoError(t, err)
+			if tc.wantErr {
+				require.Error(t, merr.Error(resp))
+				require.Contains(t, resp.GetReason(), tc.errContains)
+				return
+			}
+			require.True(t, merr.Ok(resp), resp.GetReason())
+		})
+	}
 }
 
 func TestProxy_AddCollectionField_DoesNotBlockOnSchemaVersion(t *testing.T) {

@@ -27,15 +27,14 @@ package storagev2
 import "C"
 
 import (
-	"fmt"
+	"context"
 	"strconv"
 	"unsafe"
 
-	"go.uber.org/zap"
-
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
@@ -57,7 +56,7 @@ func getMetricsFromHandle(cFilesystem C.FileSystemHandle) (*FilesystemMetrics, e
 	metricsResult := C.loon_filesystem_get_metrics(cFilesystem, &cMetrics)
 	if err := HandleLoonFFIResult(metricsResult); err != nil {
 		C.loon_filesystem_destroy(cFilesystem)
-		return nil, fmt.Errorf("failed to get filesystem metrics: %w", err)
+		return nil, merr.Wrap(err, "failed to get filesystem metrics")
 	}
 
 	fsMetrics := &FilesystemMetrics{
@@ -197,7 +196,7 @@ func makePropertiesFromConfig(storageConfig *indexpb.StorageConfig) (C.LoonPrope
 	)
 
 	if err := HandleLoonFFIResult(result); err != nil {
-		return C.LoonProperties{}, fmt.Errorf("failed to create properties: %w", err)
+		return C.LoonProperties{}, merr.Wrap(err, "failed to create properties")
 	}
 
 	return props, nil
@@ -207,7 +206,7 @@ func makePropertiesFromConfig(storageConfig *indexpb.StorageConfig) (C.LoonPrope
 // using full storage config properties for proper cache resolution.
 func GetFilesystemMetricsWithConfig(storageConfig *indexpb.StorageConfig) (*FilesystemMetrics, error) {
 	if storageConfig == nil {
-		return nil, fmt.Errorf("storageConfig is required")
+		return nil, merr.WrapErrStorageMsg("storageConfig is required")
 	}
 
 	props, err := makePropertiesFromConfig(storageConfig)
@@ -219,7 +218,7 @@ func GetFilesystemMetricsWithConfig(storageConfig *indexpb.StorageConfig) (*File
 	var cFilesystem C.FileSystemHandle
 	result := C.loon_filesystem_get(&props, nil, 0, &cFilesystem)
 	if err := HandleLoonFFIResult(result); err != nil {
-		return nil, fmt.Errorf("failed to get cached filesystem: %w", err)
+		return nil, merr.Wrap(err, "failed to get cached filesystem")
 	}
 
 	return getMetricsFromHandle(cFilesystem)
@@ -234,7 +233,7 @@ func HandleLoonFFIResult(ffiResult C.LoonFFIResult) error {
 		if errMsg != nil {
 			errStr = C.GoString(errMsg)
 		}
-		return fmt.Errorf("loon FFI error: %s", errStr)
+		return merr.WrapErrStorageMsg("loon FFI error: %s", errStr)
 	}
 	return nil
 }
@@ -296,7 +295,7 @@ func PublishDefaultFilesystemMetrics() (*FilesystemMetrics, error) {
 func PublishFilesystemMetricsWithConfig(storageConfig *indexpb.StorageConfig) (*FilesystemMetrics, error) {
 	metricSnapshot, err := GetFilesystemMetricsWithConfig(storageConfig)
 	if err != nil {
-		log.Warn("failed to get filesystem metrics with config", zap.Error(err))
+		mlog.Warn(context.TODO(), "failed to get filesystem metrics with config", mlog.Err(err))
 		return nil, err
 	}
 

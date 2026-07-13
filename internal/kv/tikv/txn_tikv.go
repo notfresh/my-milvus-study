@@ -30,12 +30,11 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 	"github.com/tikv/client-go/v2/txnkv/transaction"
 	"github.com/tikv/client-go/v2/txnkv/txnsnapshot"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/v3/kv"
 	"github.com/milvus-io/milvus/pkg/v3/kv/predicates"
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
@@ -122,7 +121,7 @@ func NewTiKV(txn *txnkv.Client, rootPath string, options ...Option) *txnTiKV {
 
 // Close closes the connection to TiKV.
 func (kv *txnTiKV) Close() {
-	log.Info("txnTiKV closed", zap.String("path", kv.rootPath))
+	mlog.Info(context.TODO(), "txnTiKV closed", mlog.String("path", kv.rootPath))
 }
 
 // GetPath returns the path of the key/prefix.
@@ -132,10 +131,11 @@ func (kv *txnTiKV) GetPath(key string) string {
 
 // Log if error is not nil. We use error pointer as in most cases this function
 // is Deferred. Deferred functions evaluate their args immediately.
-func logWarnOnFailure(err *error, msg string, fields ...zap.Field) {
+func logWarnOnFailure(err *error, msg string, fields ...mlog.Field) {
 	if *err != nil {
-		fields = append(fields, zap.Error(*err))
-		log.Warn(msg, fields...)
+		fields = append(fields, mlog.Err(*err))
+		mlog.Warn(context.TODO(),
+			msg, fields...)
 	}
 }
 
@@ -147,7 +147,7 @@ func (kv *txnTiKV) Has(ctx context.Context, key string) (bool, error) {
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV Has() error", zap.String("key", key))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV Has() error", mlog.String("key", key))
 
 	_, err := kv.getTiKVMeta(ctx, key)
 	if err != nil {
@@ -155,10 +155,10 @@ func (kv *txnTiKV) Has(ctx context.Context, key string) (bool, error) {
 		if errors.Is(err, merr.ErrIoKeyNotFound) {
 			return false, nil
 		}
-		loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to read key: %s", key))
+		loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to read key: %s", key), err.Error())
 		return false, loggingErr
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV Has() operation", zap.String("key", key))
+	CheckElapseAndWarn(start, "Slow txnTiKV Has() operation", mlog.String("key", key))
 	return true, nil
 }
 
@@ -174,7 +174,7 @@ func (kv *txnTiKV) HasPrefix(ctx context.Context, prefix string) (bool, error) {
 	prefix = kv.GetPath(prefix)
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV HasPrefix() error", zap.String("prefix", prefix))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV HasPrefix() error", mlog.String("prefix", prefix))
 
 	ss := getSnapshot(kv.txn, SnapshotScanSize)
 
@@ -184,7 +184,7 @@ func (kv *txnTiKV) HasPrefix(ctx context.Context, prefix string) (bool, error) {
 
 	iter, err := ss.Iter(startKey, endKey)
 	if err != nil {
-		loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to create iterator for prefix: %s", prefix))
+		loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to create iterator for prefix: %s", prefix), err.Error())
 		return false, loggingErr
 	}
 	defer iter.Close()
@@ -192,7 +192,7 @@ func (kv *txnTiKV) HasPrefix(ctx context.Context, prefix string) (bool, error) {
 	r := iter.Valid()
 	// Iterater only needs to check the first key-value pair
 
-	CheckElapseAndWarn(start, "Slow txnTiKV HasPrefix() operation", zap.String("prefix", prefix))
+	CheckElapseAndWarn(start, "Slow txnTiKV HasPrefix() operation", mlog.String("prefix", prefix))
 	return r, nil
 }
 
@@ -204,18 +204,18 @@ func (kv *txnTiKV) Load(ctx context.Context, key string) (string, error) {
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV Load() error", zap.String("key", key))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV Load() error", mlog.String("key", key))
 
 	val, err := kv.getTiKVMeta(ctx, key)
 	if err != nil {
 		if errors.Is(err, merr.ErrIoKeyNotFound) {
 			loggingErr = err
 		} else {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to read key %s", key))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to read key %s", key), err.Error())
 		}
 		return "", loggingErr
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV Load() operation", zap.String("key", key))
+	CheckElapseAndWarn(start, "Slow txnTiKV Load() operation", mlog.String("key", key))
 	return val, nil
 }
 
@@ -235,7 +235,7 @@ func (kv *txnTiKV) MultiLoad(ctx context.Context, keys []string) ([]string, erro
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiLoad() error", zap.Strings("keys", keys))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiLoad() error", mlog.Strings("keys", keys))
 
 	// Convert from []string to [][]byte
 	byteKeys := batchConvertFromString(kv.rootPath, keys)
@@ -245,7 +245,7 @@ func (kv *txnTiKV) MultiLoad(ctx context.Context, keys []string) ([]string, erro
 
 	keyMap, err := ss.BatchGet(ctx, byteKeys)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed ss.BatchGet() for MultiLoad")
+		loggingErr = merr.WrapErrIoFailedReason("Failed ss.BatchGet() for MultiLoad", err.Error())
 		return nil, loggingErr
 	}
 
@@ -259,14 +259,14 @@ func (kv *txnTiKV) MultiLoad(ctx context.Context, keys []string) ([]string, erro
 			missingValues = append(missingValues, k)
 		}
 		// Check if empty value placeholder
-		strVal := convertEmptyByteToString(v)
+		strVal := convertEmptyByteToString(v.Value)
 		validValues = append(validValues, strVal)
 	}
 	if len(missingValues) != 0 {
-		loggingErr = fmt.Errorf("there are invalid keys: %s", missingValues)
+		loggingErr = merr.WrapErrIoKeyNotFound(fmt.Sprintf("%v", missingValues))
 	}
 
-	CheckElapseAndWarn(start, "Slow txnTiKV MultiLoad() operation", zap.Any("keys", keys))
+	CheckElapseAndWarn(start, "Slow txnTiKV MultiLoad() operation", mlog.Any("keys", keys))
 	return validValues, loggingErr
 }
 
@@ -276,7 +276,7 @@ func (kv *txnTiKV) LoadWithPrefix(ctx context.Context, prefix string) ([]string,
 	prefix = kv.GetPath(prefix)
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV LoadWithPrefix() error", zap.String("prefix", prefix))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV LoadWithPrefix() error", mlog.String("prefix", prefix))
 
 	ss := getSnapshot(kv.txn, SnapshotScanSize)
 
@@ -285,7 +285,7 @@ func (kv *txnTiKV) LoadWithPrefix(ctx context.Context, prefix string) ([]string,
 	endKey := tikv.PrefixNextKey([]byte(prefix))
 	iter, err := ss.Iter(startKey, endKey)
 	if err != nil {
-		loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to create iterater for LoadWithPrefix() for prefix: %s", prefix))
+		loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to create iterater for LoadWithPrefix() for prefix: %s", prefix), err.Error())
 		return nil, nil, loggingErr
 	}
 	defer iter.Close()
@@ -302,11 +302,11 @@ func (kv *txnTiKV) LoadWithPrefix(ctx context.Context, prefix string) ([]string,
 		values = append(values, strVal)
 		err = iter.Next()
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to iterate for LoadWithPrefix() for prefix: %s", prefix))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to iterate for LoadWithPrefix() for prefix: %s", prefix), err.Error())
 			return nil, nil, loggingErr
 		}
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV LoadWithPrefix() operation", zap.String("prefix", prefix))
+	CheckElapseAndWarn(start, "Slow txnTiKV LoadWithPrefix() operation", mlog.String("prefix", prefix))
 	return keys, values, nil
 }
 
@@ -317,7 +317,7 @@ func (kv *txnTiKV) Save(ctx context.Context, key, value string) error {
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV Save() error", zap.String("key", key), zap.String("value", value))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV Save() error", mlog.String("key", key), mlog.String("value", value))
 
 	loggingErr = kv.putTiKVMeta(ctx, key, value)
 	return loggingErr
@@ -330,11 +330,11 @@ func (kv *txnTiKV) MultiSave(ctx context.Context, kvs map[string]string) error {
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiSave() error", zap.Any("kvs", kvs), zap.Int("len", len(kvs)))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiSave() error", mlog.Any("kvs", kvs), mlog.Int("len", len(kvs)))
 
 	txn, err := beginTxn(kv.txn)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to create txn for MultiSave")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to create txn for MultiSave", err.Error())
 		return loggingErr
 	}
 
@@ -346,22 +346,22 @@ func (kv *txnTiKV) MultiSave(ctx context.Context, kvs map[string]string) error {
 		// Check if value is empty or taking reserved EmptyValue
 		byteValue, err := convertEmptyStringToByte(value)
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to cast to byte (%s:%s) for MultiSave()", key, value))
+			loggingErr = merr.Wrap(err, fmt.Sprintf("Failed to cast to byte (%s:%s) for MultiSave()", key, value))
 			return loggingErr
 		}
 		// Save the value within a transaction
 		err = txn.Set([]byte(key), byteValue)
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to set (%s:%s) for MultiSave()", key, value))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to set (%s:%s) for MultiSave()", key, value), err.Error())
 			return loggingErr
 		}
 	}
 	err = kv.executeTxn(ctx, txn)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to commit for MultiSave()")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to commit for MultiSave()", err.Error())
 		return loggingErr
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV MultiSave() operation", zap.Any("kvs", kvs))
+	CheckElapseAndWarn(start, "Slow txnTiKV MultiSave() operation", mlog.Any("kvs", kvs))
 	return nil
 }
 
@@ -372,7 +372,7 @@ func (kv *txnTiKV) Remove(ctx context.Context, key string) error {
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV Remove() error", zap.String("key", key))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV Remove() error", mlog.String("key", key))
 
 	loggingErr = kv.removeTiKVMeta(ctx, key)
 	return loggingErr
@@ -385,11 +385,11 @@ func (kv *txnTiKV) MultiRemove(ctx context.Context, keys []string) error {
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiRemove() error", zap.Strings("keys", keys), zap.Int("len", len(keys)))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiRemove() error", mlog.Strings("keys", keys), mlog.Int("len", len(keys)))
 
 	txn, err := beginTxn(kv.txn)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to create txn for MultiRemove")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to create txn for MultiRemove", err.Error())
 		return loggingErr
 	}
 
@@ -400,17 +400,17 @@ func (kv *txnTiKV) MultiRemove(ctx context.Context, keys []string) error {
 		key = kv.GetPath(key)
 		err = txn.Delete([]byte(key))
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to delete %s for MultiRemove", key))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to delete %s for MultiRemove", key), err.Error())
 			return loggingErr
 		}
 	}
 
 	err = kv.executeTxn(ctx, txn)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to commit for MultiRemove()")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to commit for MultiRemove()", err.Error())
 		return loggingErr
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV MultiRemove() operation", zap.Strings("keys", keys))
+	CheckElapseAndWarn(start, "Slow txnTiKV MultiRemove() operation", mlog.Strings("keys", keys))
 	return nil
 }
 
@@ -422,16 +422,16 @@ func (kv *txnTiKV) RemoveWithPrefix(ctx context.Context, prefix string) error {
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV RemoveWithPrefix() error", zap.String("prefix", prefix))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV RemoveWithPrefix() error", mlog.String("prefix", prefix))
 
 	startKey := []byte(prefix)
 	endKey := tikv.PrefixNextKey(startKey)
 	_, err := kv.txn.DeleteRange(ctx, startKey, endKey, 1)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to DeleteRange for RemoveWithPrefix")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to DeleteRange for RemoveWithPrefix", err.Error())
 		return loggingErr
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV RemoveWithPrefix() operation", zap.String("prefix", prefix))
+	CheckElapseAndWarn(start, "Slow txnTiKV RemoveWithPrefix() operation", mlog.String("prefix", prefix))
 	return nil
 }
 
@@ -442,11 +442,11 @@ func (kv *txnTiKV) MultiSaveAndRemove(ctx context.Context, saves map[string]stri
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiSaveAndRemove error", zap.Any("saves", saves), zap.Strings("removes", removals), zap.Int("saveLength", len(saves)), zap.Int("removeLength", len(removals)))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiSaveAndRemove error", mlog.Any("saves", saves), mlog.Strings("removes", removals), mlog.Int("saveLength", len(saves)), mlog.Int("removeLength", len(removals)))
 
 	txn, err := beginTxn(kv.txn)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to create txn for MultiSaveAndRemove")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to create txn for MultiSaveAndRemove", err.Error())
 		return loggingErr
 	}
 
@@ -457,10 +457,10 @@ func (kv *txnTiKV) MultiSaveAndRemove(ctx context.Context, saves map[string]stri
 		key := kv.GetPath(pred.Key())
 		val, err := txn.Get(ctx, []byte(key))
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("failed to read predicate target (%s:%v) for MultiSaveAndRemove", pred.Key(), pred.TargetValue()))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("failed to read predicate target (%s:%v) for MultiSaveAndRemove", pred.Key(), pred.TargetValue()), err.Error())
 			return loggingErr
 		}
-		if !pred.IsTrue(val) {
+		if !pred.IsTrue(val.Value) {
 			loggingErr = merr.WrapErrIoFailedReason("failed to meet predicate", fmt.Sprintf("key=%s, value=%v", pred.Key(), pred.TargetValue()))
 			return loggingErr
 		}
@@ -474,7 +474,7 @@ func (kv *txnTiKV) MultiSaveAndRemove(ctx context.Context, saves map[string]stri
 	for _, key := range removals {
 		key = kv.GetPath(key)
 		if err = txn.Delete([]byte(key)); err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to delete %s for MultiSaveAndRemove", key))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to delete %s for MultiSaveAndRemove", key), err.Error())
 			return loggingErr
 		}
 	}
@@ -484,22 +484,22 @@ func (kv *txnTiKV) MultiSaveAndRemove(ctx context.Context, saves map[string]stri
 		// Check if value is empty or taking reserved EmptyValue
 		byteValue, err := convertEmptyStringToByte(value)
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to cast to byte (%s:%s) for MultiSaveAndRemove", key, value))
+			loggingErr = merr.Wrap(err, fmt.Sprintf("Failed to cast to byte (%s:%s) for MultiSaveAndRemove", key, value))
 			return loggingErr
 		}
 		err = txn.Set([]byte(key), byteValue)
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to set (%s:%s) for MultiSaveAndRemove", key, value))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to set (%s:%s) for MultiSaveAndRemove", key, value), err.Error())
 			return loggingErr
 		}
 	}
 
 	err = kv.executeTxn(ctx, txn)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to commit for MultiSaveAndRemove")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to commit for MultiSaveAndRemove", err.Error())
 		return loggingErr
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV MultiSaveAndRemove() operation", zap.Any("saves", saves), zap.Strings("removals", removals))
+	CheckElapseAndWarn(start, "Slow txnTiKV MultiSaveAndRemove() operation", mlog.Any("saves", saves), mlog.Strings("removals", removals))
 	return nil
 }
 
@@ -510,11 +510,11 @@ func (kv *txnTiKV) MultiSaveAndRemoveWithPrefix(ctx context.Context, saves map[s
 	defer cancel()
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiSaveAndRemoveWithPrefix() error", zap.Any("saves", saves), zap.Strings("removes", removals), zap.Int("saveLength", len(saves)), zap.Int("removeLength", len(removals)))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV MultiSaveAndRemoveWithPrefix() error", mlog.Any("saves", saves), mlog.Strings("removes", removals), mlog.Int("saveLength", len(saves)), mlog.Int("removeLength", len(removals)))
 
 	txn, err := beginTxn(kv.txn)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to create txn for MultiSaveAndRemoveWithPrefix")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to create txn for MultiSaveAndRemoveWithPrefix", err.Error())
 		return loggingErr
 	}
 
@@ -525,10 +525,10 @@ func (kv *txnTiKV) MultiSaveAndRemoveWithPrefix(ctx context.Context, saves map[s
 		key := kv.GetPath(pred.Key())
 		val, err := txn.Get(ctx, []byte(key))
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("failed to read predicate target (%s:%v) for MultiSaveAndRemove", pred.Key(), pred.TargetValue()))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("failed to read predicate target (%s:%v) for MultiSaveAndRemove", pred.Key(), pred.TargetValue()), err.Error())
 			return loggingErr
 		}
-		if !pred.IsTrue(val) {
+		if !pred.IsTrue(val.Value) {
 			loggingErr = merr.WrapErrIoFailedReason("failed to meet predicate", fmt.Sprintf("key=%s, value=%v", pred.Key(), pred.TargetValue()))
 			return loggingErr
 		}
@@ -544,7 +544,7 @@ func (kv *txnTiKV) MultiSaveAndRemoveWithPrefix(ctx context.Context, saves map[s
 		// Use Scan to iterate over keys in the prefix range
 		iter, err := txn.Iter(startKey, endKey)
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to create iterater for %s during MultiSaveAndRemoveWithPrefix()", prefix))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to create iterater for %s during MultiSaveAndRemoveWithPrefix()", prefix), err.Error())
 			return loggingErr
 		}
 
@@ -553,14 +553,14 @@ func (kv *txnTiKV) MultiSaveAndRemoveWithPrefix(ctx context.Context, saves map[s
 			key := iter.Key()
 			err = txn.Delete(key)
 			if loggingErr != nil {
-				loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to delete %s for MultiSaveAndRemoveWithPrefix", string(key)))
+				loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to delete %s for MultiSaveAndRemoveWithPrefix", string(key)), err.Error())
 				return loggingErr
 			}
 
 			// Move the iterator to the next key
 			err = iter.Next()
 			if err != nil {
-				loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to move Iterator after key %s for MultiSaveAndRemoveWithPrefix", string(key)))
+				loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to move Iterator after key %s for MultiSaveAndRemoveWithPrefix", string(key)), err.Error())
 				return loggingErr
 			}
 		}
@@ -572,22 +572,22 @@ func (kv *txnTiKV) MultiSaveAndRemoveWithPrefix(ctx context.Context, saves map[s
 		// Check if value is empty or taking reserved EmptyValue
 		byteValue, err := convertEmptyStringToByte(value)
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to cast to byte (%s:%s) for MultiSaveAndRemoveWithPrefix()", key, value))
+			loggingErr = merr.Wrap(err, fmt.Sprintf("Failed to cast to byte (%s:%s) for MultiSaveAndRemoveWithPrefix()", key, value))
 			return loggingErr
 		}
 		err = txn.Set([]byte(key), byteValue)
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to set (%s:%s) for MultiSaveAndRemoveWithPrefix()", key, value))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to set (%s:%s) for MultiSaveAndRemoveWithPrefix()", key, value), err.Error())
 			return loggingErr
 		}
 	}
 
 	err = kv.executeTxn(ctx, txn)
 	if err != nil {
-		loggingErr = errors.Wrap(err, "Failed to commit for MultiSaveAndRemoveWithPrefix")
+		loggingErr = merr.WrapErrIoFailedReason("Failed to commit for MultiSaveAndRemoveWithPrefix", err.Error())
 		return loggingErr
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV MultiSaveAndRemoveWithPrefix() operation", zap.Any("saves", saves), zap.Strings("removals", removals))
+	CheckElapseAndWarn(start, "Slow txnTiKV MultiSaveAndRemoveWithPrefix() operation", mlog.Any("saves", saves), mlog.Strings("removals", removals))
 	return nil
 }
 
@@ -597,7 +597,7 @@ func (kv *txnTiKV) WalkWithPrefix(ctx context.Context, prefix string, pagination
 	prefix = kv.GetPath(prefix)
 
 	var loggingErr error
-	defer logWarnOnFailure(&loggingErr, "txnTiKV WalkWithPagination error", zap.String("prefix", prefix))
+	defer logWarnOnFailure(&loggingErr, "txnTiKV WalkWithPagination error", mlog.String("prefix", prefix))
 
 	// Since only reading, use Snapshot for less overhead
 	ss := getSnapshot(kv.txn, paginationSize)
@@ -607,7 +607,7 @@ func (kv *txnTiKV) WalkWithPrefix(ctx context.Context, prefix string, pagination
 	endKey := tikv.PrefixNextKey([]byte(prefix))
 	iter, err := ss.Iter(startKey, endKey)
 	if err != nil {
-		loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to create iterater for %s during WalkWithPrefix", prefix))
+		loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to create iterater for %s during WalkWithPrefix", prefix), err.Error())
 		return loggingErr
 	}
 	defer iter.Close()
@@ -622,16 +622,16 @@ func (kv *txnTiKV) WalkWithPrefix(ctx context.Context, prefix string, pagination
 		}
 		err = fn(iter.Key(), byteVal)
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to apply fn to (%s;%s)", string(iter.Key()), string(byteVal)))
+			loggingErr = merr.Wrap(err, fmt.Sprintf("Failed to apply fn to (%s;%s)", string(iter.Key()), string(byteVal)))
 			return loggingErr
 		}
 		err = iter.Next()
 		if err != nil {
-			loggingErr = errors.Wrap(err, fmt.Sprintf("Failed to move Iterator after key %s for WalkWithPrefix", string(iter.Key())))
+			loggingErr = merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to move Iterator after key %s for WalkWithPrefix", string(iter.Key())), err.Error())
 			return loggingErr
 		}
 	}
-	CheckElapseAndWarn(start, "Slow txnTiKV WalkWithPagination() operation", zap.String("prefix", prefix))
+	CheckElapseAndWarn(start, "Slow txnTiKV WalkWithPagination() operation", mlog.String("prefix", prefix))
 	return nil
 }
 
@@ -668,16 +668,16 @@ func (kv *txnTiKV) getTiKVMeta(ctx context.Context, key string) (string, error) 
 			return "", merr.WrapErrIoKeyNotFound(key)
 		}
 		// If call to tikv fails
-		return "", errors.Wrap(err, fmt.Sprintf("Failed to get value for key %s in getTiKVMeta", key))
+		return "", merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to get value for key %s in getTiKVMeta", key), err.Error())
 	}
 
 	// Check if value is the empty placeholder
-	strVal := convertEmptyByteToString(val)
+	strVal := convertEmptyByteToString(val.Value)
 
 	elapsed := start.ElapseSpan()
 
 	metrics.MetaOpCounter.WithLabelValues(metrics.MetaGetLabel, metrics.TotalLabel).Inc()
-	metrics.MetaKvSize.WithLabelValues(metrics.MetaGetLabel).Observe(float64(len(val)))
+	metrics.MetaKvSize.WithLabelValues(metrics.MetaGetLabel).Observe(float64(len(val.Value)))
 	metrics.MetaRequestLatency.WithLabelValues(metrics.MetaGetLabel).Observe(float64(elapsed.Milliseconds()))
 	metrics.MetaOpCounter.WithLabelValues(metrics.MetaGetLabel, metrics.SuccessLabel).Inc()
 
@@ -692,7 +692,7 @@ func (kv *txnTiKV) putTiKVMeta(ctx context.Context, key, val string) error {
 
 	txn, err := beginTxn(kv.txn)
 	if err != nil {
-		return errors.Wrap(err, "Failed to build transaction for putTiKVMeta")
+		return merr.WrapErrIoFailedReason("Failed to build transaction for putTiKVMeta", err.Error())
 	}
 	// Defer a rollback only if the transaction hasn't been committed
 	defer rollbackOnFailure(&err, txn)
@@ -700,11 +700,11 @@ func (kv *txnTiKV) putTiKVMeta(ctx context.Context, key, val string) error {
 	// Check if the value being written needs to be empty placeholder
 	byteValue, err := convertEmptyStringToByte(val)
 	if err != nil {
-		return errors.Wrap(err, fmt.Sprintf("Failed to cast to byte (%s:%s) for putTiKVMeta", key, val))
+		return merr.Wrap(err, fmt.Sprintf("Failed to cast to byte (%s:%s) for putTiKVMeta", key, val))
 	}
 	err = txn.Set([]byte(key), byteValue)
 	if err != nil {
-		return errors.Wrap(err, fmt.Sprintf("Failed to set value for key %s in putTiKVMeta", key))
+		return merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to set value for key %s in putTiKVMeta", key), err.Error())
 	}
 	err = commitTxn(ctx1, txn)
 
@@ -729,14 +729,14 @@ func (kv *txnTiKV) removeTiKVMeta(ctx context.Context, key string) error {
 
 	txn, err := beginTxn(kv.txn)
 	if err != nil {
-		return errors.Wrap(err, "Failed to build transaction for removeTiKVMeta")
+		return merr.WrapErrIoFailedReason("Failed to build transaction for removeTiKVMeta", err.Error())
 	}
 	// Defer a rollback only if the transaction hasn't been committed
 	defer rollbackOnFailure(&err, txn)
 
 	err = txn.Delete([]byte(key))
 	if err != nil {
-		return errors.Wrap(err, fmt.Sprintf("Failed to remove key %s in removeTiKVMeta", key))
+		return merr.WrapErrIoFailedReason(fmt.Sprintf("Failed to remove key %s in removeTiKVMeta", key), err.Error())
 	}
 	err = commitTxn(ctx1, txn)
 
@@ -754,16 +754,17 @@ func (kv *txnTiKV) removeTiKVMeta(ctx context.Context, key string) error {
 }
 
 func (kv *txnTiKV) CompareVersionAndSwap(ctx context.Context, key string, version int64, target string) (bool, error) {
-	err := errors.New("Unimplemented! CompareVersionAndSwap is under deprecation")
+	err := errors.Wrap(merr.ErrServiceUnimplemented, "CompareVersionAndSwap is under deprecation")
 	logWarnOnFailure(&err, "Unimplemented")
 	return false, err
 }
 
 // CheckElapseAndWarn checks the elapsed time and warns if it is too long.
-func CheckElapseAndWarn(start time.Time, message string, fields ...zap.Field) bool {
+func CheckElapseAndWarn(start time.Time, message string, fields ...mlog.Field) bool {
 	elapsed := time.Since(start)
 	if elapsed.Milliseconds() > 2000 {
-		log.Warn(message, append([]zap.Field{zap.String("time spent", elapsed.String())}, fields...)...)
+		mlog.Warn(context.TODO(),
+			message, append([]mlog.Field{mlog.String("time spent", elapsed.String())}, fields...)...)
 		return true
 	}
 	return false
@@ -789,7 +790,7 @@ func convertEmptyStringToByte(value string) ([]byte, error) {
 	if len(value) == 0 {
 		return EmptyValueByte, nil
 	} else if value == EmptyValueString {
-		return nil, fmt.Errorf("value for key is reserved by EmptyValue: %s", EmptyValueString)
+		return nil, merr.WrapErrParameterInvalidMsg("value for key is reserved by EmptyValue: %s", EmptyValueString)
 	}
 	return []byte(value), nil
 }

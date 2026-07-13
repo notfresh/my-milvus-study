@@ -33,6 +33,7 @@ var errGrowingSourceProviderClosed = errors.New("growing source provider is clos
 type delegatorGrowingSourceProvider struct {
 	segmentManager  segments.SegmentManager
 	waitFence       func(context.Context, uint64) error
+	currentTSafe    func() uint64
 	mu              sync.Mutex
 	cond            *sync.Cond
 	closing         bool
@@ -46,7 +47,7 @@ type delegatorGrowingSourceProvider struct {
 	handoffAllowed  map[int64]struct{}
 }
 
-func newDelegatorGrowingSourceProvider(segmentManager segments.SegmentManager, waitFence func(context.Context, uint64) error) *delegatorGrowingSourceProvider {
+func newDelegatorGrowingSourceProvider(segmentManager segments.SegmentManager, waitFence func(context.Context, uint64) error, currentTSafe ...func() uint64) *delegatorGrowingSourceProvider {
 	provider := &delegatorGrowingSourceProvider{
 		segmentManager:  segmentManager,
 		waitFence:       waitFence,
@@ -54,6 +55,9 @@ func newDelegatorGrowingSourceProvider(segmentManager segments.SegmentManager, w
 		releaseAllowed:  make(map[int64]uint64),
 		releasePrepared: make(map[int64]int64),
 		handoffAllowed:  make(map[int64]struct{}),
+	}
+	if len(currentTSafe) > 0 {
+		provider.currentTSafe = currentTSafe[0]
 	}
 	provider.cond = sync.NewCond(&provider.mu)
 	return provider
@@ -65,7 +69,7 @@ func (p *delegatorGrowingSourceProvider) SetRegistration(registration *syncmgr.G
 	p.registration = registration
 }
 
-func (p *delegatorGrowingSourceProvider) GetGrowingFlushSource(segmentID int64, targetOffset int64, _ *msgpb.MsgPosition) (syncmgr.GrowingFlushSource, syncmgr.GrowingSourceState) {
+func (p *delegatorGrowingSourceProvider) GetGrowingFlushSource(segmentID int64, targetOffset int64, endPos *msgpb.MsgPosition) (syncmgr.GrowingFlushSource, syncmgr.GrowingSourceState) {
 	if !p.acquireLease(segmentID) {
 		return nil, syncmgr.GrowingSourceUnavailable
 	}
@@ -76,6 +80,9 @@ func (p *delegatorGrowingSourceProvider) GetGrowingFlushSource(segmentID int64, 
 		segment, ok = p.getRetained(segmentID)
 		if !ok {
 			p.releaseLease()
+			if p.activeProviderBehind(endPos) {
+				return nil, syncmgr.GrowingSourcePending
+			}
 			return nil, syncmgr.GrowingSourceUnavailable
 		}
 		retained = true
@@ -92,6 +99,17 @@ func (p *delegatorGrowingSourceProvider) GetGrowingFlushSource(segmentID int64, 
 		return source, syncmgr.GrowingSourcePending
 	}
 	return source, syncmgr.GrowingSourceUsable
+}
+
+func (p *delegatorGrowingSourceProvider) activeProviderBehind(endPos *msgpb.MsgPosition) bool {
+	if endPos == nil || endPos.GetTimestamp() == 0 || p.currentTSafe == nil {
+		return false
+	}
+	p.mu.Lock()
+	closing := p.closing
+	deactivated := p.deactivated
+	p.mu.Unlock()
+	return !closing && !deactivated && p.currentTSafe() < endPos.GetTimestamp()
 }
 
 func (p *delegatorGrowingSourceProvider) PrepareGrowingSourceReleaseHandoff(ctx context.Context, fenceTs uint64, segments []syncmgr.GrowingSourceReleaseHandoffSegment) error {
@@ -178,7 +196,7 @@ func (p *delegatorGrowingSourceProvider) registerRetained(segmentID int64, targe
 	currentOffset := p.currentOffset(segment)
 	if currentOffset < targetOffset {
 		segment.Unpin()
-		return errors.Errorf("growing-source segment %d is behind target offset, current=%d target=%d", segmentID, currentOffset, targetOffset)
+		return merr.WrapErrServiceInternalMsg("growing-source segment %d is behind target offset, current=%d target=%d", segmentID, currentOffset, targetOffset)
 	}
 
 	p.mu.Lock()
@@ -527,25 +545,53 @@ func (s *delegatorGrowingFlushSource) CurrentOffset() int64 {
 
 func (s *delegatorGrowingFlushSource) FlushGrowingData(ctx context.Context, startOffset, endOffset int64, config *syncmgr.GrowingFlushConfig) (*syncmgr.GrowingFlushResult, error) {
 	result, err := s.segment.FlushData(ctx, startOffset, endOffset, &segments.FlushConfig{
-		SegmentBasePath:      config.SegmentBasePath,
-		PartitionBasePath:    config.PartitionBasePath,
-		CollectionID:         config.CollectionID,
-		PartitionID:          config.PartitionID,
-		TextFieldIDs:         config.TextFieldIDs,
-		TextLobPaths:         config.TextLobPaths,
-		BM25FieldIDs:         config.BM25FieldIDs,
-		BM25StatsLogIDs:      config.BM25StatsLogIDs,
-		WriteMergedBM25Stats: config.WriteMergedBM25Stats,
-		ReadVersion:          config.ReadVersion,
+		SegmentBasePath:         config.SegmentBasePath,
+		PartitionBasePath:       config.PartitionBasePath,
+		CollectionID:            config.CollectionID,
+		PartitionID:             config.PartitionID,
+		Schema:                  config.Schema,
+		TextFieldIDs:            config.TextFieldIDs,
+		TextLobPaths:            config.TextLobPaths,
+		TextInlineThreshold:     config.TextInlineThreshold,
+		TextMaxLobFileBytes:     config.TextMaxLobFileBytes,
+		TextFlushThresholdBytes: config.TextFlushThresholdBytes,
+		BM25FieldIDs:            config.BM25FieldIDs,
+		BM25StatsLogIDs:         config.BM25StatsLogIDs,
+		WriteMergedBM25Stats:    config.WriteMergedBM25Stats,
+		ReadVersion:             config.ReadVersion,
+		WriterFormat:            config.WriterFormat,
+		SchemaBasedPattern:      config.SchemaBasedPattern,
+		SchemaBasedFormats:      config.SchemaBasedFormats,
+		AllowedFieldIDs:         config.AllowedFieldIDs,
+		ColumnGroups:            config.ColumnGroups,
 	})
 	if err != nil || result == nil {
 		return nil, err
 	}
 	return &syncmgr.GrowingFlushResult{
-		ManifestPath: result.ManifestPath,
-		NumRows:      result.NumRows,
-		BM25Stats:    result.BM25Stats,
+		ManifestPath:           result.ManifestPath,
+		NumRows:                result.NumRows,
+		TimestampFrom:          result.TimestampFrom,
+		TimestampTo:            result.TimestampTo,
+		FlushedFieldIDs:        result.FlushedFieldIDs,
+		ColumnGroupMemorySizes: result.ColumnGroupMemorySizes,
+		FieldNullCounts:        result.FieldNullCounts,
+		BM25Stats:              result.BM25Stats,
 	}, nil
+}
+
+// materializedFieldIDsProvider is the capability a source segment must expose
+// for the flush layout to be trimmed to its materialized columns.
+type materializedFieldIDsProvider interface {
+	MaterializedFieldIDs(ctx context.Context) ([]int64, error)
+}
+
+func (s *delegatorGrowingFlushSource) MaterializedFieldIDs(ctx context.Context) ([]int64, error) {
+	provider, ok := s.segment.(materializedFieldIDsProvider)
+	if !ok {
+		return nil, merr.WrapErrServiceInternalMsg("growing flush source segment does not expose materialized field ids")
+	}
+	return provider.MaterializedFieldIDs(ctx)
 }
 
 func (s *delegatorGrowingFlushSource) Release() {

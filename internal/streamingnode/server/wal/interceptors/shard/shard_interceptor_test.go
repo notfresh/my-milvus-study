@@ -8,28 +8,28 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"go.uber.org/atomic"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/wal/interceptors/shard/mock_shards"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/shards"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/internal/util/function"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/rmq"
 )
 
-func TestShardInterceptorLogsOmittedSchemaVersionAsNotProvided(t *testing.T) {
-	core, logs := observer.New(zapcore.WarnLevel)
-	logger := &log.MLogger{Logger: zap.New(core)}
+func TestShardInterceptorPassesOmittedSchemaVersionToChecker(t *testing.T) {
 	b := NewInterceptorBuilder()
 	shardManager := mock_shards.NewMockShardManager(t)
-	shardManager.EXPECT().Logger().Return(logger).Maybe()
+	shardManager.EXPECT().Logger().Return(mlog.With()).Maybe()
 	i := b.Build(&interceptors.InterceptorBuildParam{
 		ShardManager: shardManager,
 	})
@@ -60,16 +60,12 @@ func TestShardInterceptorLogsOmittedSchemaVersionAsNotProvided(t *testing.T) {
 	})
 	assert.Error(t, err)
 	assert.Nil(t, msgID)
-
-	entries := logs.FilterMessage("insertMessage schema version mismatch").All()
-	assert.Len(t, entries, 1)
-	assert.Equal(t, false, entries[0].ContextMap()["schemaVersionProvided"])
 }
 
 func TestShardInterceptorReportsExplicitZeroSchemaVersionInMismatchError(t *testing.T) {
 	b := NewInterceptorBuilder()
 	shardManager := mock_shards.NewMockShardManager(t)
-	shardManager.EXPECT().Logger().Return(log.With()).Maybe()
+	shardManager.EXPECT().Logger().Return(mlog.With()).Maybe()
 	i := b.Build(&interceptors.InterceptorBuildParam{
 		ShardManager: shardManager,
 	})
@@ -105,10 +101,62 @@ func TestShardInterceptorReportsExplicitZeroSchemaVersionInMismatchError(t *test
 	assert.Nil(t, msgID)
 }
 
+func TestShardInterceptorUpdateFunctionRunnersReleasesWhenFunctionsDropped(t *testing.T) {
+	collectionID := int64(99001)
+	vchannel := "by-dev-rootcoord-dml_0_99001v0"
+	schema := &schemapb.CollectionSchema{
+		Name:    "test",
+		Version: 1,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{
+				FieldID:  101,
+				Name:     "text",
+				DataType: schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.MaxLengthKey, Value: "256"},
+				},
+			},
+			{FieldID: 102, Name: "sparse", DataType: schemapb.DataType_SparseFloatVector, IsFunctionOutput: true},
+		},
+		Functions: []*schemapb.FunctionSchema{
+			{
+				Name:           "bm25",
+				Type:           schemapb.FunctionType_BM25,
+				InputFieldIds:  []int64{101},
+				OutputFieldIds: []int64{102},
+			},
+		},
+	}
+	assert.NoError(t, function.AllocFunctionRunners(collectionID, walFunctionRunnerKey(vchannel), schema))
+	defer function.ReleaseFunctionRunners(collectionID, walFunctionRunnerKey(vchannel))
+
+	ok, err := function.RunWithAnalyzer(context.Background(), collectionID, schema.GetVersion(), 101, func(function.Analyzer) error {
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.True(t, ok)
+
+	shardManager := mock_shards.NewMockShardManager(t)
+	shardManager.EXPECT().Logger().Return(mlog.With()).Maybe()
+	impl := &shardInterceptor{shardManager: shardManager}
+
+	noFunctionSchema := proto.Clone(schema).(*schemapb.CollectionSchema)
+	noFunctionSchema.Version = 2
+	noFunctionSchema.Functions = nil
+	impl.updateFunctionRunners(collectionID, vchannel, noFunctionSchema)
+
+	ok, err = function.RunWithAnalyzer(context.Background(), collectionID, schema.GetVersion(), 101, func(function.Analyzer) error {
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.False(t, ok)
+}
+
 func TestShardInterceptorDeleteAppliesBeforeAppend(t *testing.T) {
 	b := NewInterceptorBuilder()
 	shardManager := mock_shards.NewMockShardManager(t)
-	shardManager.EXPECT().Logger().Return(log.With()).Maybe()
+	shardManager.EXPECT().Logger().Return(mlog.With()).Maybe()
 	i := b.Build(&interceptors.InterceptorBuildParam{
 		ShardManager: shardManager,
 	})
@@ -138,7 +186,7 @@ func TestShardInterceptorDeleteAppliesBeforeAppend(t *testing.T) {
 func TestShardInterceptorPassesExplicitNonZeroSchemaVersion(t *testing.T) {
 	b := NewInterceptorBuilder()
 	shardManager := mock_shards.NewMockShardManager(t)
-	shardManager.EXPECT().Logger().Return(log.With()).Maybe()
+	shardManager.EXPECT().Logger().Return(mlog.With()).Maybe()
 	i := b.Build(&interceptors.InterceptorBuildParam{
 		ShardManager: shardManager,
 	})
@@ -176,7 +224,7 @@ func TestShardInterceptorPassesExplicitNonZeroSchemaVersion(t *testing.T) {
 func TestShardInterceptorPassesExplicitZeroSchemaVersion(t *testing.T) {
 	b := NewInterceptorBuilder()
 	shardManager := mock_shards.NewMockShardManager(t)
-	shardManager.EXPECT().Logger().Return(log.With()).Maybe()
+	shardManager.EXPECT().Logger().Return(mlog.With()).Maybe()
 	i := b.Build(&interceptors.InterceptorBuildParam{
 		ShardManager: shardManager,
 	})
@@ -217,7 +265,7 @@ func TestShardInterceptor(t *testing.T) {
 
 	b := NewInterceptorBuilder()
 	shardManager := mock_shards.NewMockShardManager(t)
-	shardManager.EXPECT().Logger().Return(log.With()).Maybe()
+	shardManager.EXPECT().Logger().Return(mlog.With()).Maybe()
 	i := b.Build(&interceptors.InterceptorBuildParam{
 		ShardManager: shardManager,
 	})
@@ -429,10 +477,11 @@ func TestShardInterceptor(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, msgID)
 
-	// Unexpected error from the schema version check must be propagated as-is.
+	// Unexpected error from the schema version check must stop producer retry.
 	shardManager.EXPECT().CheckIfCollectionSchemaVersionMatch(insertHdrMatcher).Return(int32(-1), mockErr).Once()
 	msgID, err = i.DoAppend(ctx, msg, appender)
 	assert.Error(t, err)
+	assert.True(t, status.AsStreamingError(err).IsUnrecoverable())
 	assert.Nil(t, msgID)
 
 	msg = message.NewDeleteMessageBuilderV1().

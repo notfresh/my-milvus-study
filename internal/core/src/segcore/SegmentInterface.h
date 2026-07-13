@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -104,7 +105,8 @@ class SegmentInterface {
            Timestamp collection_ttl,
            int64_t entity_ttl_physical_time_us = 0,
            bool filter_only = false,
-           bool enable_expr_cache = false) const = 0;
+           bool enable_expr_cache = false,
+           milvus::tracer::SpanPtr trace_span = nullptr) const = 0;
 
     // Only used for test
     std::unique_ptr<SearchResult>
@@ -353,6 +355,16 @@ class SegmentInternalInterface : public SegmentInterface {
         // do nothing
     }
 
+    // Convenience: prefetch all chunks of a field. Default impl enumerates
+    // [0, num_chunk(field_id)) and forwards to the typed overload.
+    virtual void
+    prefetch_chunks(milvus::OpContext* op_ctx, FieldId field_id) const {
+    }
+
+    virtual void
+    prefetch_vector(milvus::OpContext* op_ctx, FieldId field_id) const {
+    }
+
     // Apply field nullability to an already-initialized valid_result bitmap.
     // Implementations only clear invalid rows and leave valid rows unchanged.
     virtual void
@@ -482,7 +494,8 @@ class SegmentInternalInterface : public SegmentInterface {
            Timestamp collection_ttl,
            int64_t entity_ttl_physical_time_us = 0,
            bool filter_only = false,
-           bool enable_expr_cache = false) const override;
+           bool enable_expr_cache = false,
+           milvus::tracer::SpanPtr trace_span = nullptr) const override;
 
     void
     FillPrimaryKeys(const query::Plan* plan,
@@ -521,6 +534,13 @@ class SegmentInternalInterface : public SegmentInterface {
     bool
     FieldAccessible(FieldId field_id) const {
         return HasFieldData(field_id) || HasIndex(field_id);
+    }
+
+    // Returns whether the segment's loaded manifest contains the storage
+    // column. Non-manifest segment types default to true.
+    virtual bool
+    HasColumnInLoadedManifest(const std::string&) const {
+        return true;
     }
 
     // JSON indexes (JsonFlatIndex + JSON-cast scalar) live in a separate

@@ -48,6 +48,9 @@ class IndexFactory {
         return instance;
     }
 
+    static bool
+    CanUseIndexRawDataForField(DataType field_type, bool has_raw_data);
+
     LoadResourceRequest
     IndexLoadResource(DataType field_type,
                       DataType element_type,
@@ -164,6 +167,11 @@ class IndexFactory {
 
     IndexBasePtr
     CreateNestedIndexScalarIndexSort(
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
+
+    IndexBasePtr
+    CreateNestedIndexBitmap(
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
 

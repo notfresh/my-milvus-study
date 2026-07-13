@@ -16,9 +16,11 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/Try.h>
 #include <folly/futures/Promise.h>
+#include <algorithm>
 #include <cstring>
+#include <cstdint>
+#include <cstdlib>
 #include <exception>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -35,7 +37,6 @@
 #include "common/OpContext.h"
 #include "common/QueryInfo.h"
 #include "common/QueryResult.h"
-#include "common/ScopedTimer.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "common/Utils.h"
@@ -51,14 +52,11 @@
 #include "futures/Future.h"
 #include "glog/logging.h"
 #include "index/Meta.h"
-#include "index/json_stats/JsonKeyStats.h"
 #include "log/Log.h"
 #include "milvus-storage/filesystem/fs.h"
-#include "monitor/Monitor.h"
 #include "monitor/scope_metric.h"
 #include "nlohmann/json.hpp"
 #include "opentelemetry/trace/span.h"
-#include "pb/index_cgo_msg.pb.h"
 #include "pb/schema.pb.h"
 #include "pb/segcore.pb.h"
 #include "prometheus/histogram.h"
@@ -74,7 +72,6 @@
 #include "segcore/SegmentSealed.h"
 #include "segcore/Types.h"
 #include "storage/FileManager.h"
-#include "storage/RemoteChunkManagerSingleton.h"
 #include "storage/ThreadPools.h"
 #include "storage/Types.h"
 #include "storage/loon_ffi/property_singleton.h"
@@ -82,10 +79,12 @@
 // milvus-storage headers for FlushGrowingSegmentData
 #include "milvus-storage/segment/segment_writer.h"
 #include "milvus-storage/transaction/transaction.h"
+#include "milvus-storage/common/arrow_util.h"
 #include "milvus-storage/common/layout.h"
 #include "milvus-storage/filesystem/fs.h"
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/common/config.h"
+#include "milvus-storage/common/extend_status.h"
 #include "milvus-storage/properties.h"
 
 // Arrow headers for FlushGrowingSegmentData
@@ -200,6 +199,17 @@ ParseReopenSchema(const void* schema_blob,
     auto schema = milvus::Schema::ParseFrom(collection_schema);
     schema->set_schema_version(schema_version);
     return schema;
+}
+
+milvus::SchemaPtr
+ParseFlushSchema(const void* schema_blob, const int64_t schema_length) {
+    AssertInfo(schema_blob != nullptr, "flush schema is null");
+    AssertInfo(schema_length > 0, "flush schema length must be positive");
+
+    milvus::proto::schema::CollectionSchema collection_schema;
+    auto suc = collection_schema.ParseFromArray(schema_blob, schema_length);
+    AssertInfo(suc, "parse flush schema proto failed");
+    return milvus::Schema::ParseFrom(collection_schema);
 }
 
 CFuture*
@@ -355,6 +365,50 @@ GetSearchResultValidCount(CSearchResult search_result) {
     return res->valid_count_;
 }
 
+// Verifies the plan's external field references against the loaded manifest,
+// after LazyCheckSchema refreshed the segment schema and manifest view.
+// Optionally ignores fields that the current execution path will not access.
+void
+CheckExternalFieldsInLoadedManifest(
+    const milvus::SchemaPtr& schema,
+    milvus::segcore::SegmentInternalInterface* segment,
+    const std::vector<milvus::FieldId>& fields,
+    const std::vector<milvus::FieldId>& skipped_fields = {}) {
+    if (!schema || !schema->is_external_collection()) {
+        return;
+    }
+
+    for (auto field_id : fields) {
+        if (std::find(skipped_fields.begin(), skipped_fields.end(), field_id) !=
+            skipped_fields.end()) {
+            continue;
+        }
+        if (!schema->has_field(field_id)) {
+            continue;
+        }
+
+        if (!schema->IsExternalManifestStoredField(field_id)) {
+            continue;
+        }
+        const auto& field_meta = schema->operator[](field_id);
+        auto column_name = schema->GetPhysicalColumnName(field_id);
+        // External output may be served through take(), so "ready" here means
+        // the loaded manifest contains the storage column. It intentionally
+        // does not require field data or index accessibility.
+        if (!segment->HasColumnInLoadedManifest(column_name)) {
+            throw milvus::SegcoreError(
+                milvus::FieldNotLoaded,
+                fmt::format(
+                    "external field \"{}\" (storage column \"{}\") is not "
+                    "available in the current loaded external collection "
+                    "manifest; run RefreshExternalCollection and reload the "
+                    "collection before accessing this field",
+                    field_meta.get_name().get(),
+                    column_name));
+        }
+    }
+}
+
 //////////////////////////////    public C API wrappers    //////////////////////////////
 
 CFuture*  // Future<milvus::SearchResult*>
@@ -404,6 +458,17 @@ AsyncSearch(CTraceContext c_trace,
             auto internal_segment =
                 static_cast<milvus::segcore::SegmentInternalInterface*>(
                     segment);
+            std::vector<milvus::FieldId> skipped_manifest_fields;
+            if (filter_only) {
+                skipped_manifest_fields.push_back(target_vector_field_id);
+                for (auto field_id : plan->target_entries_) {
+                    skipped_manifest_fields.push_back(field_id);
+                }
+            }
+            CheckExternalFieldsInLoadedManifest(plan->schema_,
+                                                internal_segment,
+                                                plan->access_entries_,
+                                                skipped_manifest_fields);
             std::unique_ptr<milvus::SearchResult> search_result;
             if (!filter_only &&
                 !internal_segment->FieldAccessible(target_vector_field_id)) {
@@ -420,7 +485,8 @@ AsyncSearch(CTraceContext c_trace,
                                                 collection_ttl,
                                                 entity_ttl_physical_time_us,
                                                 filter_only,
-                                                enable_expr_cache);
+                                                enable_expr_cache,
+                                                span);
             }
             if (!filter_only &&
                 !milvus::PositivelyRelated(
@@ -496,6 +562,11 @@ AsyncRetrieve(CTraceContext c_trace,
 
             milvus::OpContext op_ctx(cancel_token);
             segment->LazyCheckSchema(plan->schema_, &op_ctx);
+            auto internal_segment =
+                static_cast<milvus::segcore::SegmentInternalInterface*>(
+                    segment);
+            CheckExternalFieldsInLoadedManifest(
+                plan->schema_, internal_segment, plan->access_entries_);
 
             auto retrieve_result =
                 segment->Retrieve(&trace_ctx,
@@ -536,6 +607,11 @@ AsyncRetrieveByOffsets(CTraceContext c_trace,
 
             milvus::OpContext op_ctx(cancel_token);
             segment->LazyCheckSchema(plan->schema_, &op_ctx);
+            auto internal_segment =
+                static_cast<milvus::segcore::SegmentInternalInterface*>(
+                    segment);
+            CheckExternalFieldsInLoadedManifest(
+                plan->schema_, internal_segment, plan->access_entries_);
 
             auto retrieve_result =
                 segment->Retrieve(&trace_ctx, plan, offsets, len, cancel_token);
@@ -726,113 +802,6 @@ UpdateSealedSegmentIndex(CSegmentInterface c_segment,
         auto load_index_info =
             static_cast<milvus::segcore::LoadIndexInfo*>(c_load_index_info);
         segment->LoadIndex(*load_index_info);
-        return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(&e);
-    }
-}
-
-CStatus
-LoadJsonKeyIndex(CTraceContext c_trace,
-                 CSegmentInterface c_segment,
-                 const uint8_t* serialized_load_json_key_index_info,
-                 const uint64_t len,
-                 CLoadCancellationSource source) {
-    SCOPE_CGO_CALL_METRIC();
-
-    try {
-        auto ctx = milvus::tracer::TraceContext{
-            c_trace.traceID, c_trace.spanID, c_trace.traceFlags};
-        auto segment_interface =
-            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
-        auto segment =
-            dynamic_cast<milvus::segcore::SegmentSealed*>(segment_interface);
-        AssertInfo(segment != nullptr, "segment conversion failed");
-
-        // Check for cancellation before starting
-        if (source) {
-            auto cancellation_source =
-                static_cast<folly::CancellationSource*>(source);
-            if (cancellation_source->getToken().isCancellationRequested()) {
-                throw milvus::SegcoreError(
-                    milvus::ErrorCode::FollyCancel,
-                    fmt::format("Load cancelled for segment {} json stats",
-                                segment->get_segment_id()));
-            }
-        }
-
-        auto info_proto =
-            std::make_unique<milvus::proto::indexcgo::LoadJsonKeyIndexInfo>();
-        info_proto->ParseFromArray(serialized_load_json_key_index_info, len);
-        if (!milvus::JSON_KEY_STATS_ENABLED.load()) {
-            LOG_WARN(
-                "skip load json stats because json key stats is disabled, "
-                "segment:{}, field:{}, build:{}, version:{}",
-                segment->get_segment_id(),
-                info_proto->fieldid(),
-                info_proto->buildid(),
-                info_proto->version());
-            return milvus::SuccessCStatus();
-        }
-
-        milvus::storage::FieldDataMeta field_meta{info_proto->collectionid(),
-                                                  info_proto->partitionid(),
-                                                  segment->get_segment_id(),
-                                                  info_proto->fieldid(),
-                                                  info_proto->schema()};
-        milvus::storage::IndexMeta index_meta{segment->get_segment_id(),
-                                              info_proto->fieldid(),
-                                              info_proto->buildid(),
-                                              info_proto->version()};
-        auto remote_chunk_manager =
-            milvus::storage::RemoteChunkManagerSingleton::GetInstance()
-                .GetRemoteChunkManager();
-        auto fs = milvus::segcore::GetDefaultArrowFileSystem();
-        AssertInfo(fs != nullptr, "arrow file system is null");
-
-        milvus::Config config;
-        std::vector<std::string> files;
-        files.reserve(info_proto->files_size());
-        for (const auto& f : info_proto->files()) {
-            files.push_back(f);
-        }
-        config[milvus::index::INDEX_FILES] = files;
-        config[milvus::LOAD_PRIORITY] = info_proto->load_priority();
-        config[milvus::index::ENABLE_MMAP] = info_proto->enable_mmap();
-        if (info_proto->enable_mmap()) {
-            config[milvus::index::MMAP_FILE_PATH] = info_proto->mmap_dir_path();
-        }
-        if (info_proto->warmup_policy() != "") {
-            config[milvus::index::WARMUP] = info_proto->warmup_policy();
-        }
-        config[milvus::index::INDEX_SIZE] = info_proto->stats_size();
-        if (!info_proto->base_path().empty()) {
-            config[STATS_BASE_PATH_KEY] = info_proto->base_path();
-        }
-
-        milvus::storage::FileManagerContext file_ctx(
-            field_meta, index_meta, remote_chunk_manager, fs);
-
-        auto index =
-            std::make_shared<milvus::index::JsonKeyStats>(file_ctx, true);
-        {
-            milvus::ScopedTimer timer(
-                "json_stats_load",
-                [](double us) {
-                    milvus::monitor::internal_json_stats_latency_load.Observe(
-                        us / 1000.0);
-                },
-                milvus::ScopedTimer::LogLevel::Info);
-            index->Load(ctx, config);
-        }
-
-        segment->LoadJsonStats(milvus::FieldId(info_proto->fieldid()),
-                               std::move(index));
-
-        LOG_INFO("load json stats success for field:{} of segment:{}",
-                 info_proto->fieldid(),
-                 segment->get_segment_id());
-
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
         return milvus::FailureCStatus(&e);
@@ -1151,6 +1120,55 @@ IsFixedWidthVectorDataType(milvus::DataType data_type) {
            data_type == milvus::DataType::VECTOR_INT8;
 }
 
+arrow::Result<int64_t>
+GetFixedWidthVectorValueAlignment(milvus::DataType data_type) {
+    switch (data_type) {
+        case milvus::DataType::VECTOR_FLOAT:
+            return alignof(float);
+        case milvus::DataType::VECTOR_BINARY:
+            return alignof(uint8_t);
+        case milvus::DataType::VECTOR_FLOAT16:
+            return alignof(milvus::float16);
+        case milvus::DataType::VECTOR_BFLOAT16:
+            return alignof(milvus::bfloat16);
+        case milvus::DataType::VECTOR_INT8:
+            return alignof(milvus::int8);
+        default:
+            return arrow::Status::Invalid(fmt::format(
+                "unsupported fixed-width vector data type {}", data_type));
+    }
+}
+
+bool
+IsBufferAligned(const void* data, int64_t alignment) {
+    if (data == nullptr || alignment <= 1) {
+        return true;
+    }
+    return reinterpret_cast<std::uintptr_t>(data) %
+               static_cast<std::uintptr_t>(alignment) ==
+           0;
+}
+
+arrow::Result<std::shared_ptr<arrow::Buffer>>
+WrapOrCopyArrowBuffer(const void* data, int64_t size, int64_t alignment) {
+    if (size < 0) {
+        return arrow::Status::Invalid("negative Arrow buffer size");
+    }
+    if (data == nullptr && size > 0) {
+        return arrow::Status::Invalid("null Arrow buffer data");
+    }
+    auto raw_data = static_cast<const uint8_t*>(data);
+    if (IsBufferAligned(data, alignment)) {
+        return arrow::Buffer::Wrap(raw_data, size);
+    }
+
+    ARROW_ASSIGN_OR_RAISE(auto copied_buffer, arrow::AllocateBuffer(size));
+    if (size > 0) {
+        std::memcpy(copied_buffer->mutable_data(), raw_data, size);
+    }
+    return std::shared_ptr<arrow::Buffer>(std::move(copied_buffer));
+}
+
 const uint8_t*
 GetPhysicalVectorValue(const milvus::segcore::VectorBase* vec_base,
                        int64_t physical_offset,
@@ -1171,7 +1189,8 @@ arrow::Result<std::shared_ptr<arrow::Array>>
 BuildNullableFixedWidthVectorArray(const FieldInfo& field_info,
                                    int64_t start_offset,
                                    int64_t num_rows,
-                                   int64_t byte_width) {
+                                   int64_t byte_width,
+                                   int64_t data_alignment) {
     if (!field_info.valid_data) {
         return arrow::Status::Invalid(
             "nullable vector field missing ValidData");
@@ -1209,8 +1228,10 @@ BuildNullableFixedWidthVectorArray(const FieldInfo& field_info,
             }
             std::shared_ptr<arrow::Buffer> offsets_buffer_shared(
                 std::move(offsets_buffer));
-            auto data_buffer =
-                arrow::Buffer::Wrap(value, num_rows * byte_width);
+            ARROW_ASSIGN_OR_RAISE(
+                auto data_buffer,
+                WrapOrCopyArrowBuffer(
+                    value, num_rows * byte_width, data_alignment));
             return std::make_shared<arrow::BinaryArray>(
                 num_rows, offsets_buffer_shared, data_buffer, nullptr, 0);
         }
@@ -1291,9 +1312,10 @@ WrapChunkAsArrowArray(const void* chunk_data,
                       int64_t element_size,
                       const milvus::segcore::ThreadSafeValidDataPtr& valid_data,
                       int64_t validity_offset) {
-    // wrap data buffer (zero-copy)
-    auto data_buffer = arrow::Buffer::Wrap(
-        static_cast<const uint8_t*>(chunk_data), num_rows * element_size);
+    ARROW_ASSIGN_OR_RAISE(
+        auto data_buffer,
+        WrapOrCopyArrowBuffer(
+            chunk_data, num_rows * element_size, element_size));
 
     // build validity bitmap if needed
     std::shared_ptr<arrow::Buffer> null_bitmap = nullptr;
@@ -1327,12 +1349,14 @@ WrapChunkAsFixedSizeBinaryArray(
     const void* chunk_data,
     int64_t num_rows,
     int64_t byte_width,
+    int64_t data_alignment,
     const std::shared_ptr<arrow::DataType>& data_type,
     const milvus::segcore::ThreadSafeValidDataPtr& valid_data,
     int64_t validity_offset) {
-    // wrap data buffer (zero-copy)
-    auto data_buffer = arrow::Buffer::Wrap(
-        static_cast<const uint8_t*>(chunk_data), num_rows * byte_width);
+    ARROW_ASSIGN_OR_RAISE(
+        auto data_buffer,
+        WrapOrCopyArrowBuffer(
+            chunk_data, num_rows * byte_width, data_alignment));
 
     // build validity bitmap if needed
     std::shared_ptr<arrow::Buffer> null_bitmap = nullptr;
@@ -1431,11 +1455,6 @@ arrow::Result<std::shared_ptr<arrow::Array>>
 BuildVectorArrayForChunk(const FieldInfo& field_info,
                          int64_t start_offset,
                          int64_t num_rows) {
-    if (field_info.valid_data) {
-        return arrow::Status::Invalid(
-            "VECTOR_ARRAY does not support null rows");
-    }
-
     auto vector_array_vec = dynamic_cast<
         const milvus::segcore::ConcurrentVector<milvus::VectorArray>*>(
         field_info.vec_base);
@@ -1451,7 +1470,21 @@ BuildVectorArrayForChunk(const FieldInfo& field_info,
     ARROW_RETURN_NOT_OK(builder.Reserve(num_rows));
 
     for (int64_t i = 0; i < num_rows; i++) {
-        const auto& vector_array = (*vector_array_vec)[start_offset + i];
+        auto logical_offset = start_offset + i;
+        if (field_info.valid_data &&
+            !field_info.valid_data->is_valid(logical_offset)) {
+            ARROW_RETURN_NOT_OK(builder.AppendNull());
+            continue;
+        }
+
+        auto physical_offset =
+            field_info.vec_base->get_physical_offset(logical_offset);
+        if (physical_offset < 0) {
+            return arrow::Status::Invalid(
+                "valid nullable vector array row missing physical data");
+        }
+
+        const auto& vector_array = (*vector_array_vec)[physical_offset];
         if (vector_array.get_element_type() != field_info.element_type) {
             return arrow::Status::Invalid("VECTOR_ARRAY element type mismatch");
         }
@@ -1672,15 +1705,22 @@ BuildArrayForChunk(const FieldInfo& field_info,
         case milvus::DataType::VECTOR_FLOAT16:
         case milvus::DataType::VECTOR_BFLOAT16:
         case milvus::DataType::VECTOR_INT8: {
+            ARROW_ASSIGN_OR_RAISE(
+                auto data_alignment,
+                GetFixedWidthVectorValueAlignment(field_info.data_type));
             if (field_info.nullable) {
-                return BuildNullableFixedWidthVectorArray(
-                    field_info, global_offset, num_rows, element_size);
+                return BuildNullableFixedWidthVectorArray(field_info,
+                                                          global_offset,
+                                                          num_rows,
+                                                          element_size,
+                                                          data_alignment);
             }
             auto arrow_type =
                 milvus::GetArrowDataType(field_info.data_type, field_info.dim);
             return WrapChunkAsFixedSizeBinaryArray(get_data_ptr(),
                                                    num_rows,
                                                    element_size,
+                                                   data_alignment,
                                                    arrow_type,
                                                    field_info.valid_data,
                                                    global_offset);
@@ -1702,6 +1742,51 @@ BuildArrayForChunk(const FieldInfo& field_info,
 }  // anonymous namespace
 
 CStatus
+GetGrowingSegmentMaterializedFieldIDs(CSegmentInterface c_segment,
+                                      int64_t** field_ids,
+                                      int64_t* count) {
+    SCOPE_CGO_CALL_METRIC();
+
+    try {
+        if (!c_segment || !field_ids || !count) {
+            return milvus::FailureCStatus(
+                milvus::UnexpectedError,
+                "invalid arguments: segment, field_ids and count must not be "
+                "null");
+        }
+        *field_ids = nullptr;
+        *count = 0;
+        auto segment_interface =
+            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
+        auto growing_segment =
+            dynamic_cast<milvus::segcore::SegmentGrowingImpl*>(
+                segment_interface);
+        if (!growing_segment) {
+            return milvus::FailureCStatus(milvus::UnexpectedError,
+                                          "segment is not a growing segment");
+        }
+        auto ids = growing_segment->get_insert_record().get_data_field_ids();
+        if (!ids.empty()) {
+            auto* buf =
+                static_cast<int64_t*>(malloc(sizeof(int64_t) * ids.size()));
+            if (!buf) {
+                return milvus::FailureCStatus(
+                    milvus::UnexpectedError,
+                    "failed to allocate materialized field ids");
+            }
+            for (size_t i = 0; i < ids.size(); i++) {
+                buf[i] = ids[i];
+            }
+            *field_ids = buf;
+            *count = static_cast<int64_t>(ids.size());
+        }
+        return milvus::SuccessCStatus();
+    } catch (std::exception& e) {
+        return milvus::FailureCStatus(&e);
+    }
+}
+
+CStatus
 FlushGrowingSegmentData(CSegmentInterface c_segment,
                         int64_t start_offset,
                         int64_t end_offset,
@@ -1719,6 +1804,16 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
         result->manifest_path = nullptr;
         result->committed_version = 0;
         result->num_rows = 0;
+        result->timestamp_from = 0;
+        result->timestamp_to = 0;
+        result->field_ids = nullptr;
+        result->field_null_counts = nullptr;
+        result->num_field_stats = 0;
+        result->flushed_field_ids = nullptr;
+        result->num_flushed_fields = 0;
+        result->column_group_ids = nullptr;
+        result->column_group_memory_sizes = nullptr;
+        result->num_column_groups = 0;
         result->bm25_field_ids = nullptr;
         result->bm25_stats = nullptr;
         result->bm25_stats_sizes = nullptr;
@@ -1740,6 +1835,25 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
                 milvus::UnexpectedError,
                 "invalid BM25 config: bm25_stats_log_ids is null");
         }
+        if (config->num_allowed_fields > 0 &&
+            config->allowed_field_ids == nullptr) {
+            return milvus::FailureCStatus(
+                milvus::UnexpectedError,
+                "invalid allowed field config: allowed_field_ids is null");
+        }
+        if (config->num_column_groups > 0 &&
+            (config->column_group_ids == nullptr ||
+             config->column_group_field_counts == nullptr)) {
+            return milvus::FailureCStatus(
+                milvus::UnexpectedError,
+                "invalid column group config: column group arrays are null");
+        }
+        if (config->schema_blob == nullptr || config->schema_length <= 0) {
+            return milvus::FailureCStatus(
+                milvus::UnexpectedError,
+                "invalid flush schema config: schema_blob is null or "
+                "schema_length is not positive");
+        }
 
         // no data to flush
         if (start_offset == end_offset) {
@@ -1756,8 +1870,11 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
                                           "segment is not a growing segment");
         }
 
-        // get schema from segment
-        auto& schema = growing_segment->get_schema();
+        // Use the schema selected by the flush task. The growing segment's
+        // runtime schema may be advanced by concurrent LazyCheckSchema/Reopen.
+        auto flush_schema =
+            ParseFlushSchema(config->schema_blob, config->schema_length);
+        const auto& schema = *flush_schema;
         auto& insert_record = growing_segment->get_insert_record();
 
         int64_t total_rows = end_offset - start_offset;
@@ -1768,51 +1885,77 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
             bm25_stats_log_ids[config->bm25_field_ids[i]] =
                 config->bm25_stats_log_ids[i];
         }
+        std::unordered_set<int64_t> allowed_field_ids;
+        for (size_t i = 0; i < config->num_allowed_fields; i++) {
+            allowed_field_ids.insert(config->allowed_field_ids[i]);
+        }
         std::unordered_map<int64_t, BM25StatsAccumulator> bm25_stats;
 
         // Use get_field_ids() (ordered vector) instead of get_fields() (unordered_map)
         // to ensure deterministic column order matching the reader's expected order.
         std::vector<FieldInfo> field_infos;
         std::vector<std::shared_ptr<arrow::Field>> arrow_fields;
-
-        {
-            const auto& field_meta = milvus::FieldMeta::RowIdMeta;
-            FieldInfo info;
-            info.field_id = RowFieldID;
-            info.field_name = field_meta.get_name().get();
-            info.data_type = field_meta.get_data_type();
-            info.element_type = milvus::DataType::NONE;
-            info.nullable = field_meta.is_nullable();
-            info.dim = 0;
-            info.vec_base = &insert_record.row_ids_;
-            info.valid_data = nullptr;
-            info.text_lob_spillover = nullptr;
-            field_infos.push_back(std::move(info));
-
-            auto metadata = arrow::KeyValueMetadata::Make(
-                {milvus_storage::ARROW_FIELD_ID_KEY},
-                {std::to_string(RowFieldID.get())});
-            auto arrow_type =
-                milvus::GetArrowDataType(field_meta.get_data_type(), 0);
-            arrow_fields.push_back(
-                arrow::field(std::to_string(RowFieldID.get()),
-                             arrow_type,
-                             field_meta.is_nullable(),
-                             metadata));
-        }
+        // Columns legally skipped below (dropped fields, non-materialized
+        // function outputs); the column-group accounting loop must tolerate
+        // their absence as well.
+        std::unordered_set<int64_t> skipped_columns;
 
         for (const auto& field_id : schema.get_field_ids()) {
-            if (field_id == RowFieldID) {
-                continue;  // skip RowID system field
+            if (!allowed_field_ids.empty() &&
+                allowed_field_ids.find(field_id.get()) ==
+                    allowed_field_ids.end()) {
+                continue;
             }
 
             const auto& field_meta = schema[field_id];
 
-            // Timestamp is stored in insert_record.timestamps_, not in data_ map
+            // System fields are stored outside the regular field data map.
             const milvus::segcore::VectorBase* vec_base;
-            if (field_id == TimestampFieldID) {
+            if (field_id == RowFieldID) {
+                vec_base = &insert_record.row_ids_;
+            } else if (field_id == TimestampFieldID) {
                 vec_base = &insert_record.timestamps_;
             } else {
+                // HasFieldData, not is_data_exist: a column the ctor
+                // allocated but replayed older-era inserts never filled is
+                // not materialized either.
+                if (!growing_segment->HasFieldData(field_id)) {
+                    // Legally absent: the field is gone from the segment's
+                    // own schema (dropped; the flush schema is a staler
+                    // snapshot), or it is a function output the segment
+                    // never materializes (backfilled by bump-schema
+                    // compaction). The Go layer normally trims such columns
+                    // from the layout already — this is the defense for
+                    // stale layouts.
+                    if (!growing_segment->get_schema().has_field(field_id)) {
+                        LOG_INFO(
+                            "skip dropped field {} when flushing growing "
+                            "segment {}",
+                            field_id.get(),
+                            growing_segment->get_segment_id());
+                        skipped_columns.insert(field_id.get());
+                        continue;
+                    }
+                    if (schema.is_function_output(field_id)) {
+                        LOG_INFO(
+                            "skip non-materialized function output field {} "
+                            "when flushing growing segment {}",
+                            field_id.get(),
+                            growing_segment->get_segment_id());
+                        skipped_columns.insert(field_id.get());
+                        continue;
+                    }
+                    // A regular field of the segment's own schema is
+                    // materialized by the ctor/Reopen by construction;
+                    // reaching here is real data loss.
+                    return milvus::FailureCStatus(
+                        milvus::UnexpectedError,
+                        fmt::format("field {} has no field data in growing "
+                                    "segment {} but is present in the "
+                                    "segment schema",
+                                    field_id.get(),
+                                    growing_segment->get_segment_id()));
+                }
                 vec_base = insert_record.get_data_base(field_id);
                 if (!vec_base) {
                     LOG_ERROR("no data base for field {} of segment {}",
@@ -1903,6 +2046,20 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
                                           "no fields to flush");
         }
 
+        // Publish the authoritative flushed-column set directly from
+        // field_infos; Go binlog meta must be derived from this.
+        result->flushed_field_ids =
+            static_cast<int64_t*>(malloc(sizeof(int64_t) * field_infos.size()));
+        if (!result->flushed_field_ids) {
+            return milvus::FailureCStatus(
+                milvus::UnexpectedError,
+                "failed to allocate flushed field ids");
+        }
+        result->num_flushed_fields = field_infos.size();
+        for (size_t i = 0; i < field_infos.size(); i++) {
+            result->flushed_field_ids[i] = field_infos[i].field_id.get();
+        }
+
         auto arrow_schema = arrow::schema(arrow_fields);
 
         // build SegmentWriterConfig
@@ -1921,14 +2078,34 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
         }
 
         // set required properties for ColumnGroupPolicy
-        // use single column group policy (all columns in one group)
-        writer_config.properties[PROPERTY_WRITER_POLICY] =
-            std::string(LOON_COLUMN_GROUP_POLICY_SINGLE);
+        if (config->schema_based_pattern &&
+            config->schema_based_pattern[0] != '\0') {
+            milvus_storage::api::SetValue(
+                writer_config.properties,
+                PROPERTY_WRITER_POLICY,
+                LOON_COLUMN_GROUP_POLICY_SCHEMA_BASED);
+            milvus_storage::api::SetValue(writer_config.properties,
+                                          PROPERTY_WRITER_SCHEMA_BASE_PATTERNS,
+                                          config->schema_based_pattern);
+            if (config->schema_based_formats &&
+                config->schema_based_formats[0] != '\0') {
+                milvus_storage::api::SetValue(
+                    writer_config.properties,
+                    PROPERTY_WRITER_SCHEMA_BASE_FORMATS,
+                    config->schema_based_formats);
+            }
+        } else {
+            milvus_storage::api::SetValue(writer_config.properties,
+                                          PROPERTY_WRITER_POLICY,
+                                          LOON_COLUMN_GROUP_POLICY_SINGLE);
+        }
         auto writer_format =
             config->writer_format && config->writer_format[0] != '\0'
                 ? std::string(config->writer_format)
                 : std::string(LOON_FORMAT_PARQUET);
-        writer_config.properties[PROPERTY_WRITER_FORMAT] = writer_format;
+        milvus_storage::api::SetValue(writer_config.properties,
+                                      PROPERTY_WRITER_FORMAT,
+                                      writer_format.c_str());
 
         // add TEXT column configs
         for (size_t i = 0; i < config->num_text_columns; i++) {
@@ -1936,6 +2113,18 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
             text_config.field_id = config->text_field_ids[i];
             if (config->text_lob_paths && config->text_lob_paths[i]) {
                 text_config.lob_base_path = config->text_lob_paths[i];
+            }
+            if (config->text_inline_threshold > 0) {
+                text_config.inline_threshold =
+                    static_cast<size_t>(config->text_inline_threshold);
+            }
+            if (config->text_max_lob_file_bytes > 0) {
+                text_config.max_lob_file_bytes =
+                    static_cast<size_t>(config->text_max_lob_file_bytes);
+            }
+            if (config->text_flush_threshold_bytes > 0) {
+                text_config.flush_threshold_bytes =
+                    static_cast<size_t>(config->text_flush_threshold_bytes);
             }
             text_config.properties = writer_config.properties;
             writer_config.lob_columns[text_config.field_id] = text_config;
@@ -1962,6 +2151,11 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
         int64_t size_per_chunk = field_infos[0].vec_base->get_size_per_chunk();
         int64_t current_offset = start_offset;
         int64_t rows_written = 0;
+        std::unordered_map<int64_t, int64_t> field_uncompressed_sizes;
+        std::unordered_map<int64_t, int64_t> field_null_counts;
+        uint64_t timestamp_from = std::numeric_limits<uint64_t>::max();
+        uint64_t timestamp_to = 0;
+        bool has_timestamp = false;
 
         while (current_offset < end_offset) {
             int64_t chunk_id = current_offset / size_per_chunk;
@@ -1993,7 +2187,30 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
                         milvus::UnexpectedError,
                         arr_result.status().ToString());
                 }
-                arrays.push_back(arr_result.ValueOrDie());
+                auto arr = arr_result.ValueOrDie();
+                auto field_id = field_info.field_id.get();
+                field_uncompressed_sizes[field_id] += static_cast<int64_t>(
+                    milvus_storage::GetArrowArrayMemorySize(arr));
+                field_null_counts[field_id] += arr->null_count();
+                if (field_info.field_id == TimestampFieldID) {
+                    auto ts_array =
+                        std::dynamic_pointer_cast<arrow::Int64Array>(arr);
+                    if (!ts_array) {
+                        return milvus::FailureCStatus(
+                            milvus::UnexpectedError,
+                            "timestamp field is not int64 array");
+                    }
+                    for (int64_t i = 0; i < ts_array->length(); i++) {
+                        if (ts_array->IsNull(i)) {
+                            continue;
+                        }
+                        auto ts = static_cast<uint64_t>(ts_array->Value(i));
+                        timestamp_from = std::min(timestamp_from, ts);
+                        timestamp_to = std::max(timestamp_to, ts);
+                        has_timestamp = true;
+                    }
+                }
+                arrays.push_back(arr);
 
                 auto stats_iter = bm25_stats.find(field_info.field_id.get());
                 if (stats_iter != bm25_stats.end()) {
@@ -2028,6 +2245,78 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
                                           close_result.status().ToString());
         }
         auto output = std::move(close_result).ValueOrDie();
+        if (rows_written > 0 && !has_timestamp) {
+            return milvus::FailureCStatus(milvus::UnexpectedError,
+                                          "timestamp field was not flushed");
+        }
+        result->timestamp_from = has_timestamp ? timestamp_from : 0;
+        result->timestamp_to = has_timestamp ? timestamp_to : 0;
+        if (!field_infos.empty()) {
+            auto num_field_stats = field_infos.size();
+            result->field_ids = static_cast<int64_t*>(
+                malloc(sizeof(int64_t) * num_field_stats));
+            result->field_null_counts = static_cast<int64_t*>(
+                malloc(sizeof(int64_t) * num_field_stats));
+            if (!result->field_ids || !result->field_null_counts) {
+                return milvus::FailureCStatus(
+                    milvus::UnexpectedError,
+                    "failed to allocate growing flush field stats");
+            }
+            result->num_field_stats = num_field_stats;
+            for (size_t i = 0; i < num_field_stats; i++) {
+                auto field_id = field_infos[i].field_id.get();
+                result->field_ids[i] = field_id;
+                result->field_null_counts[i] = field_null_counts[field_id];
+            }
+        }
+        if (config->num_column_groups > 0) {
+            result->column_group_ids = static_cast<int64_t*>(
+                malloc(sizeof(int64_t) * config->num_column_groups));
+            result->column_group_memory_sizes = static_cast<int64_t*>(
+                malloc(sizeof(int64_t) * config->num_column_groups));
+            if (!result->column_group_ids ||
+                !result->column_group_memory_sizes) {
+                return milvus::FailureCStatus(
+                    milvus::UnexpectedError,
+                    "failed to allocate growing flush column group stats");
+            }
+            result->num_column_groups = config->num_column_groups;
+            size_t field_offset = 0;
+            for (size_t i = 0; i < config->num_column_groups; i++) {
+                auto group_id = config->column_group_ids[i];
+                int64_t group_memory_size = 0;
+                auto field_count = config->column_group_field_counts[i];
+                if (field_count > 0 &&
+                    config->column_group_field_ids == nullptr) {
+                    return milvus::FailureCStatus(
+                        milvus::UnexpectedError,
+                        "invalid column group config: field ids are null");
+                }
+                for (size_t j = 0; j < field_count; j++) {
+                    auto field_id =
+                        config->column_group_field_ids[field_offset + j];
+                    if (skipped_columns.count(field_id) > 0) {
+                        // Column intentionally not flushed; contributes no
+                        // size and must not fail the accounting.
+                        continue;
+                    }
+                    auto size_it = field_uncompressed_sizes.find(field_id);
+                    if (size_it == field_uncompressed_sizes.end()) {
+                        return milvus::FailureCStatus(
+                            milvus::UnexpectedError,
+                            fmt::format("missing memory size for field {} in "
+                                        "column group {} of segment {}",
+                                        field_id,
+                                        group_id,
+                                        growing_segment->get_segment_id()));
+                    }
+                    group_memory_size += size_it->second;
+                }
+                field_offset += field_count;
+                result->column_group_ids[i] = group_id;
+                result->column_group_memory_sizes[i] = group_memory_size;
+            }
+        }
 
         // commit via Transaction externally
         auto transaction_result =
@@ -2182,6 +2471,26 @@ FreeFlushResult(CFlushResult* result) {
         free(result->manifest_path);
         result->manifest_path = nullptr;
     }
+    if (result && result->field_ids) {
+        free(result->field_ids);
+        result->field_ids = nullptr;
+    }
+    if (result && result->field_null_counts) {
+        free(result->field_null_counts);
+        result->field_null_counts = nullptr;
+    }
+    if (result && result->flushed_field_ids) {
+        free(result->flushed_field_ids);
+        result->flushed_field_ids = nullptr;
+    }
+    if (result && result->column_group_ids) {
+        free(result->column_group_ids);
+        result->column_group_ids = nullptr;
+    }
+    if (result && result->column_group_memory_sizes) {
+        free(result->column_group_memory_sizes);
+        result->column_group_memory_sizes = nullptr;
+    }
     if (result && result->bm25_stats) {
         for (size_t i = 0; i < result->num_bm25_stats; i++) {
             free(result->bm25_stats[i]);
@@ -2198,6 +2507,8 @@ FreeFlushResult(CFlushResult* result) {
         result->bm25_stats_sizes = nullptr;
     }
     if (result) {
+        result->num_field_stats = 0;
+        result->num_column_groups = 0;
         result->num_bm25_stats = 0;
     }
 }

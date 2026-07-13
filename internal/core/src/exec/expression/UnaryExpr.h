@@ -17,6 +17,7 @@
 #pragma once
 
 #include <fmt/core.h>
+#include <folly/Unit.h>
 
 #include <optional>
 #include <utility>
@@ -476,18 +477,19 @@ struct UnaryElementFunc {
     }
 };
 
-#define UnaryArrayCompare(cmp)                                          \
-    do {                                                                \
-        if constexpr (std::is_same_v<GetType, proto::plan::Array>) {    \
-            res[i] = false;                                             \
-        } else {                                                        \
-            if (index >= src[i].length()) {                             \
-                res[i] = false;                                         \
-                continue;                                               \
-            }                                                           \
-            auto array_data = src[i].template get_data<GetType>(index); \
-            res[i] = (cmp);                                             \
-        }                                                               \
+#define UnaryArrayCompare(cmp)                                               \
+    do {                                                                     \
+        if constexpr (std::is_same_v<GetType, proto::plan::Array>) {         \
+            res[i] = false;                                                  \
+        } else {                                                             \
+            if (index >= src[offset].length()) {                             \
+                res[i] = false;                                              \
+                valid_res[i] = false;                                        \
+                continue;                                                    \
+            }                                                                \
+            auto array_data = src[offset].template get_data<GetType>(index); \
+            res[i] = (cmp);                                                  \
+        }                                                                    \
     } while (false)
 
 template <typename ValueType, proto::plan::OpType op, FilterType filter_type>
@@ -521,6 +523,10 @@ struct UnaryElementFuncForArray {
                 regex_matcher.emplace(val);
             }
         }
+        if constexpr (!std::is_same_v<GetType, proto::plan::Array>) {
+            AssertInfo(index >= 0,
+                       "array element predicate requires nested path");
+        }
         for (int i = 0; i < size; ++i) {
             auto offset = i;
             if constexpr (filter_type == FilterType::random) {
@@ -539,6 +545,7 @@ struct UnaryElementFuncForArray {
                 } else {
                     if (index >= src[offset].length()) {
                         res[i] = false;
+                        valid_res[i] = false;
                         continue;
                     }
                     auto array_data =
@@ -551,6 +558,7 @@ struct UnaryElementFuncForArray {
                 } else {
                     if (index >= src[offset].length()) {
                         res[i] = false;
+                        valid_res[i] = false;
                         continue;
                     }
                     auto array_data =
@@ -579,6 +587,7 @@ struct UnaryElementFuncForArray {
                                      std::is_same_v<GetType, std::string>) {
                     if (index >= src[offset].length()) {
                         res[i] = false;
+                        valid_res[i] = false;
                         continue;
                     }
                     auto array_data =
@@ -598,6 +607,7 @@ struct UnaryElementFuncForArray {
                                      std::is_same_v<GetType, std::string>) {
                     if (index >= src[offset].length()) {
                         res[i] = false;
+                        valid_res[i] = false;
                         continue;
                     }
                     auto array_data =
@@ -935,7 +945,7 @@ class ShreddingArrayBsonExecutor {
                 reinterpret_cast<const uint8_t*>(src[i].data()), src[i].size());
             auto array_view = bson.ParseAsArrayAtOffset(0);
             if (!array_view.has_value()) {
-                res[i] = false;
+                res[i] = valid_res[i] = false;
                 continue;
             }
             bool equal = CompareTwoJsonArray(array_view.value(), val_);
@@ -1010,7 +1020,7 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
                 pinned_ngram_index_ = segment->GetNgramIndex(op_ctx_, field_id);
             }
         }
-        DetermineExecPath();
+        // DetermineExecPath();
     }
 
     void
@@ -1021,8 +1031,7 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
 
     bool
     SupportOffsetInput() override {
-        if (expr_->op_type_ == proto::plan::OpType::TextMatch ||
-            expr_->op_type_ == proto::plan::OpType::PhraseMatch) {
+        if (IsTextIndexOpType(expr_->op_type_)) {
             return false;
         }
         return true;
@@ -1106,6 +1115,9 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
     VectorPtr
     ExecRangeVisitorImplJson(EvalCtx& context);
 
+    VectorPtr
+    ExecRangeVisitorImplJsonPreciseNumeric(EvalCtx& context);
+
     template <typename ExprValueType>
     VectorPtr
     ExecRangeVisitorImplJsonByStats();
@@ -1149,6 +1161,13 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
 
     static std::pair<std::string, std::string>
     SplitAtFirstSlashDigit(std::string input);
+
+    void
+    PrefetchRawData() override;
+
+    template <typename T>
+    void
+    PrefetchRawData();
 
  private:
     std::shared_ptr<const milvus::expr::UnaryRangeFilterExpr> expr_;

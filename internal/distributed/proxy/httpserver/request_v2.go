@@ -22,11 +22,13 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/util/importutilv2"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
@@ -260,6 +262,47 @@ type ImportReq struct {
 	Options        map[string]string `json:"options"`
 }
 
+const (
+	autoCommitTrue  = "true"
+	autoCommitFalse = "false"
+)
+
+func (req *ImportReq) UnmarshalJSON(data []byte) error {
+	type importReqAlias struct {
+		DbName         string             `json:"dbName"`
+		CollectionName string             `json:"collectionName" binding:"required"`
+		PartitionName  string             `json:"partitionName"`
+		Files          [][]string         `json:"files" binding:"required"`
+		Options        map[string]*string `json:"options"`
+	}
+	var decoded importReqAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	options := make(map[string]string, len(decoded.Options))
+	for key, value := range decoded.Options {
+		if value == nil {
+			if key == importutilv2.AutoCommitKey {
+				return merr.WrapErrParameterInvalidMsg("options.%s must be one of %q or %q", importutilv2.AutoCommitKey, autoCommitTrue, autoCommitFalse)
+			}
+			options[key] = ""
+			continue
+		}
+		if key == importutilv2.AutoCommitKey && strings.ToLower(*value) != autoCommitTrue && strings.ToLower(*value) != autoCommitFalse {
+			return merr.WrapErrParameterInvalidMsg("options.%s must be one of %q or %q", importutilv2.AutoCommitKey, autoCommitTrue, autoCommitFalse)
+		}
+		options[key] = *value
+	}
+
+	req.DbName = decoded.DbName
+	req.CollectionName = decoded.CollectionName
+	req.PartitionName = decoded.PartitionName
+	req.Files = decoded.Files
+	req.Options = options
+	return nil
+}
+
 func (req *ImportReq) GetDbName() string {
 	return req.DbName
 }
@@ -286,14 +329,36 @@ type JobIDReq struct {
 
 func (req *JobIDReq) GetJobID() string { return req.JobID }
 
+type RestoreExternalSnapshotReq struct {
+	DbName               string `json:"dbName"`
+	TargetCollectionName string `json:"targetCollectionName" binding:"required"`
+	SnapshotMetadataURI  string `json:"snapshotMetadataURI" binding:"required"`
+	ExternalSpec         string `json:"externalSpec"`
+}
+
+func (req *RestoreExternalSnapshotReq) GetDbName() string { return req.DbName }
+
+type ExportSnapshotReq struct {
+	DbName         string `json:"dbName"`
+	CollectionName string `json:"collectionName" binding:"required"`
+	Name           string `json:"snapshotName" binding:"required"`
+	TargetS3Path   string `json:"targetS3Path" binding:"required"`
+	ExternalSpec   string `json:"externalSpec"`
+}
+
+func (req *ExportSnapshotReq) GetDbName() string { return req.DbName }
+
 type QueryReqV2 struct {
-	DbName           string                 `json:"dbName"`
-	CollectionName   string                 `json:"collectionName" binding:"required"`
-	PartitionNames   []string               `json:"partitionNames"`
-	OutputFields     []string               `json:"outputFields"`
-	Filter           string                 `json:"filter"`
-	Limit            int32                  `json:"limit"`
-	Offset           int32                  `json:"offset"`
+	DbName         string   `json:"dbName"`
+	CollectionName string   `json:"collectionName" binding:"required"`
+	PartitionNames []string `json:"partitionNames"`
+	OutputFields   []string `json:"outputFields"`
+	Filter         string   `json:"filter"`
+	Limit          int32    `json:"limit"`
+	Offset         int32    `json:"offset"`
+	// OrderByFields sorts query results by scalar fields; each item is
+	// "fieldName" or "fieldName:asc" / "fieldName:desc" (default asc).
+	OrderByFields    []string               `json:"orderByFields"`
 	ExprParams       map[string]interface{} `json:"exprParams"`
 	ConsistencyLevel string                 `json:"consistencyLevel"`
 }
@@ -393,6 +458,7 @@ type SearchReqV2 struct {
 	ConsistencyLevel  string                 `json:"consistencyLevel"`
 	ExprParams        map[string]interface{} `json:"exprParams"`
 	FunctionScore     FunctionScore          `json:"functionScore"`
+	FunctionChains    []FunctionChainReq     `json:"functionChains"`
 	SearchAggregation *SearchAggregationReq  `json:"searchAggregation"`
 	// not use Params any more, just for compatibility
 	Params map[string]float64 `json:"params"`
@@ -463,6 +529,7 @@ type HybridSearchReq struct {
 	OutputFields      []string              `json:"outputFields"`
 	ConsistencyLevel  string                `json:"consistencyLevel"`
 	FunctionScore     FunctionScore         `json:"functionScore"`
+	FunctionChains    []FunctionChainReq    `json:"functionChains"`
 	SearchAggregation *SearchAggregationReq `json:"searchAggregation"`
 }
 
@@ -518,14 +585,16 @@ type TimestampGetter interface {
 	GetTimestamp() uint64
 }
 type PasswordReq struct {
-	UserName string `json:"userName" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	UserName    string  `json:"userName" binding:"required"`
+	Password    string  `json:"password" binding:"required"`
+	Description *string `json:"description"`
 }
 
 type NewPasswordReq struct {
-	UserName    string `json:"userName" binding:"required"`
-	Password    string `json:"password" binding:"required"`
-	NewPassword string `json:"newPassword" binding:"required"`
+	UserName    string  `json:"userName" binding:"required"`
+	Password    string  `json:"password"`
+	NewPassword string  `json:"newPassword"`
+	Description *string `json:"description"`
 }
 
 type UserRoleReq struct {
@@ -534,14 +603,19 @@ type UserRoleReq struct {
 }
 
 type RoleReq struct {
-	DbName   string `json:"dbName"`
-	RoleName string `json:"roleName" binding:"required"`
+	DbName      string `json:"dbName"`
+	RoleName    string `json:"roleName" binding:"required"`
+	Description string `json:"description"`
 }
 
 func (req *RoleReq) GetDbName() string { return req.DbName }
 
 func (req *RoleReq) GetRoleName() string {
 	return req.RoleName
+}
+
+func (req *RoleReq) GetDescription() string {
+	return req.Description
 }
 
 type PrivilegeGroupReq struct {
@@ -642,6 +716,7 @@ func (req *DropIndexPropertiesReq) GetIndexName() string {
 
 type FieldSchema struct {
 	FieldName         string                 `json:"fieldName" binding:"required"`
+	Description       string                 `json:"description"`
 	DataType          string                 `json:"dataType" binding:"required"`
 	ElementDataType   string                 `json:"elementDataType"`
 	ExternalField     string                 `json:"externalField"`
@@ -649,6 +724,8 @@ type FieldSchema struct {
 	IsPartitionKey    bool                   `json:"isPartitionKey"`
 	IsClusteringKey   bool                   `json:"isClusteringKey"`
 	ElementTypeParams map[string]interface{} `json:"elementTypeParams"`
+	TypeParams        map[string]interface{} `json:"typeParams"`
+	Fields            []FieldSchema          `json:"fields"`
 	Nullable          bool                   `json:"nullable"`
 	DefaultValue      interface{}            `json:"defaultValue"`
 }
@@ -656,12 +733,13 @@ type FieldSchema struct {
 func (field *FieldSchema) GetProto(ctx context.Context) (*schemapb.FieldSchema, error) {
 	fieldDataType, ok := schemapb.DataType_value[field.DataType]
 	if !ok {
-		log.Ctx(ctx).Warn("field's data type is invalid(case sensitive).", zap.Any("fieldDataType", field.DataType), zap.Any("field", field))
+		mlog.Warn(ctx, "field's data type is invalid(case sensitive).", mlog.Any("fieldDataType", field.DataType), mlog.Any("field", field))
 		return nil, merr.WrapErrParameterInvalidMsg("data type %s is invalid(case sensitive)", field.DataType)
 	}
 	dataType := schemapb.DataType(fieldDataType)
 	fieldSchema := &schemapb.FieldSchema{
 		Name:            field.FieldName,
+		Description:     field.Description,
 		IsPrimaryKey:    field.IsPrimary,
 		IsPartitionKey:  field.IsPartitionKey,
 		IsClusteringKey: field.IsClusteringKey,
@@ -674,12 +752,12 @@ func (field *FieldSchema) GetProto(ctx context.Context) (*schemapb.FieldSchema, 
 	var err error
 	fieldSchema.DefaultValue, err = convertDefaultValue(field.DefaultValue, dataType)
 	if err != nil {
-		log.Ctx(ctx).Warn("convert defaultValue fail", zap.Any("defaultValue", field.DefaultValue), zap.Error(err))
+		mlog.Warn(ctx, "convert defaultValue fail", mlog.Any("defaultValue", field.DefaultValue), mlog.Err(err))
 		return nil, merr.WrapErrParameterInvalidMsg("convert defaultValue fail, err: %s", err.Error())
 	}
 	if dataType == schemapb.DataType_Array || dataType == schemapb.DataType_ArrayOfVector {
 		if _, ok := schemapb.DataType_value[field.ElementDataType]; !ok {
-			log.Ctx(ctx).Warn("element's data type is invalid(case sensitive).", zap.Any("elementDataType", field.ElementDataType), zap.Any("field", field))
+			mlog.Warn(ctx, "element's data type is invalid(case sensitive).", mlog.Any("elementDataType", field.ElementDataType), mlog.Any("field", field))
 			return nil, merr.WrapErrParameterInvalidMsg("element data type %s is invalid(case sensitive)", field.ElementDataType)
 		}
 		fieldSchema.ElementType = schemapb.DataType(schemapb.DataType_value[field.ElementDataType])
@@ -694,6 +772,39 @@ func (field *FieldSchema) GetProto(ctx context.Context) (*schemapb.FieldSchema, 
 	return fieldSchema, nil
 }
 
+func (field *FieldSchema) IsStructArrayField() bool {
+	if field == nil {
+		return false
+	}
+	return field.DataType == schemapb.DataType_ArrayOfStruct.String() ||
+		field.DataType == schemapb.DataType_Array.String() && field.ElementDataType == schemapb.DataType_Struct.String()
+}
+
+func (field *FieldSchema) GetStructArrayProto(ctx context.Context) (*schemapb.StructArrayFieldSchema, error) {
+	if field == nil {
+		return nil, merr.WrapErrParameterInvalidMsg("StructArray field schema is required")
+	}
+	if !field.IsStructArrayField() {
+		return nil, merr.WrapErrParameterInvalidMsg(
+			"StructArray field must use ArrayOfStruct or Array with Struct element, got dataType %s and elementDataType %s",
+			field.DataType, field.ElementDataType)
+	}
+	typeParams := make(map[string]interface{}, len(field.TypeParams)+len(field.ElementTypeParams))
+	for key, param := range field.ElementTypeParams {
+		typeParams[key] = param
+	}
+	for key, param := range field.TypeParams {
+		typeParams[key] = param
+	}
+	return (&StructArrayFieldSchema{
+		FieldName:   field.FieldName,
+		Description: field.Description,
+		Fields:      field.Fields,
+		TypeParams:  typeParams,
+		Nullable:    field.Nullable,
+	}).GetProto(ctx)
+}
+
 // StructArrayFieldSchema describes a struct array field in RESTful v2 API.
 // Each struct array field contains multiple sub-fields; every sub-field must
 // be declared as either Array (scalar element) or ArrayOfVector (vector element).
@@ -702,6 +813,7 @@ type StructArrayFieldSchema struct {
 	Description string                 `json:"description"`
 	Fields      []FieldSchema          `json:"fields" binding:"required"`
 	TypeParams  map[string]interface{} `json:"typeParams"`
+	Nullable    bool                   `json:"nullable"`
 }
 
 // GetProto converts the RESTful StructArrayFieldSchema to its proto counterpart.
@@ -714,6 +826,16 @@ func (sf *StructArrayFieldSchema) GetProto(ctx context.Context) (*schemapb.Struc
 		Name:        sf.FieldName,
 		Description: sf.Description,
 		TypeParams:  []*commonpb.KeyValuePair{},
+		Nullable:    sf.Nullable,
+	}
+	parentTypeParams := make(map[string]string, len(sf.TypeParams))
+	for key, param := range sf.TypeParams {
+		value, err := getElementTypeParams(param)
+		if err != nil {
+			return nil, err
+		}
+		parentTypeParams[key] = value
+		proto.TypeParams = append(proto.TypeParams, &commonpb.KeyValuePair{Key: key, Value: value})
 	}
 	subNames := map[string]struct{}{}
 	for i := range sf.Fields {
@@ -747,21 +869,51 @@ func (sf *StructArrayFieldSchema) GetProto(ctx context.Context) (*schemapb.Struc
 				"duplicated sub-field name %s in struct %s", subProto.Name, sf.FieldName)
 		}
 		subNames[subProto.Name] = struct{}{}
+		if maxCapacity, ok := parentTypeParams[common.MaxCapacityKey]; ok && !hasTypeParam(subProto.TypeParams, common.MaxCapacityKey) {
+			subProto.TypeParams = append(subProto.TypeParams, &commonpb.KeyValuePair{Key: common.MaxCapacityKey, Value: maxCapacity})
+		}
 		proto.Fields = append(proto.Fields, subProto)
 	}
-	for key, param := range sf.TypeParams {
-		value, err := getElementTypeParams(param)
-		if err != nil {
-			return nil, err
-		}
-		proto.TypeParams = append(proto.TypeParams, &commonpb.KeyValuePair{Key: key, Value: value})
-	}
 	return proto, nil
+}
+
+func hasTypeParam(typeParams []*commonpb.KeyValuePair, key string) bool {
+	for _, typeParam := range typeParams {
+		if typeParam.GetKey() == key {
+			return true
+		}
+	}
+	return false
 }
 
 type FunctionScore struct {
 	Functions []FunctionSchema       `json:"functions"`
 	Params    map[string]interface{} `json:"params"`
+}
+
+type FunctionChainReq struct {
+	Name  string               `json:"name"`
+	Stage string               `json:"stage"`
+	Ops   []FunctionChainOpReq `json:"ops"`
+}
+
+type FunctionChainOpReq struct {
+	Op      string                 `json:"op"`
+	Expr    *FunctionChainExprReq  `json:"expr"`
+	Inputs  []string               `json:"inputs"`
+	Outputs []string               `json:"outputs"`
+	Params  map[string]interface{} `json:"params"`
+}
+
+type FunctionChainExprReq struct {
+	Name   string                    `json:"name"`
+	Args   []FunctionChainExprArgReq `json:"args"`
+	Params map[string]interface{}    `json:"params"`
+}
+
+type FunctionChainExprArgReq struct {
+	Column  *string     `json:"column"`
+	Literal interface{} `json:"literal"`
 }
 
 type FunctionSchema struct {
@@ -790,11 +942,14 @@ type CollectionReq struct {
 	IDType           string                 `json:"idType"`
 	AutoID           bool                   `json:"autoID"`
 	MetricType       string                 `json:"metricType"`
+	VectorFieldType  string                 `json:"vectorFieldType"`
+	ConsistencyLevel string                 `json:"consistencyLevel"`
 	PrimaryFieldName string                 `json:"primaryFieldName"`
 	VectorFieldName  string                 `json:"vectorFieldName"`
 	Schema           CollectionSchema       `json:"schema"`
 	IndexParams      []IndexParam           `json:"indexParams"`
 	Params           map[string]interface{} `json:"params"`
+	Properties       map[string]interface{} `json:"properties"`
 	Description      string                 `json:"description"`
 	// Top-level external config is accepted only for explicit rejection.
 	// Create external collection must use schema.externalSource/schema.externalSpec.

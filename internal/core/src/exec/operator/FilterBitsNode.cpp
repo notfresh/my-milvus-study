@@ -55,6 +55,26 @@ BuildExprCacheKey(const plan::FilterBitsNode& filter,
 
 }  // namespace
 
+bool
+ConvertPredicateToFilteredBitset(TargetBitmapView data,
+                                 TargetBitmapView valid,
+                                 const size_t size) {
+    // FilterBitsNode outputs a filtered-row bitset: 1 means excluded. A SQL-style
+    // predicate passes only when it is definitely TRUE, so UNKNOWN/NULL must be
+    // excluded together with FALSE.
+    if (valid.all()) {
+        data.flip();
+        return true;
+    }
+
+    data.flip();
+    TargetBitmap invalid(valid);
+    invalid.flip();
+    data.inplace_or(invalid, size);
+    valid.set();
+    return false;
+}
+
 PhyFilterBitsNode::PhyFilterBitsNode(
     int32_t operator_id,
     DriverContext* driverctx,
@@ -68,7 +88,12 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     query_context_ = exec_context->get_query_context();
     std::vector<expr::TypedExprPtr> filters;
     filters.emplace_back(filter->filter());
-    exprs_ = std::make_unique<ExprSet>(filters, exec_context);
+    // This operator folds UNKNOWN predicate rows into the excluded set
+    // (ConvertPredicateToFilteredBitset), i.e. it is a null-rejecting
+    // consumer: let conjunctions in the predicate tree drop UNKNOWN rows
+    // from their active sets early.
+    exprs_ = std::make_unique<ExprSet>(
+        filters, exec_context, /*null_rejecting=*/true);
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
 
@@ -118,6 +143,7 @@ PhyFilterBitsNode::GetOutput() {
         ExprResCacheManager::Key key{cache_segment->get_segment_id(),
                                      expr_cache_key_};
         ExprResCacheManager::Value cached;
+        cached.active_count = need_process_rows_;
         if (ExprResCacheManager::Instance().Get(key, cached) &&
             cached.result != nullptr &&
             cached.result->size() == need_process_rows_) {
@@ -134,6 +160,8 @@ PhyFilterBitsNode::GetOutput() {
     tracer::AutoSpan span(
         "PhyFilterBitsNode::Execute", tracer::GetRootSpan(), true);
     tracer::AddEvent(fmt::format("input_rows: {}", need_process_rows_));
+
+    exprs_->WaitPrefetch();
 
     std::chrono::high_resolution_clock::time_point scalar_start =
         std::chrono::high_resolution_clock::now();
@@ -158,9 +186,9 @@ PhyFilterBitsNode::GetOutput() {
                    "PhyFilterBitsNode result should be bitmap ColumnVector");
 
         auto col_vec_size = col_vec->size();
-        // flip in-place on the result bitmap, no extra copy
         TargetBitmapView view(col_vec->GetRawData(), col_vec_size);
-        view.flip();
+        TargetBitmapView valid_view(col_vec->GetValidRawData(), col_vec_size);
+        ConvertPredicateToFilteredBitset(view, valid_view, col_vec_size);
         num_processed_rows_ = col_vec_size;
 
         AssertInfo(col_vec_size == need_process_rows_,
@@ -169,8 +197,6 @@ PhyFilterBitsNode::GetOutput() {
                    need_process_rows_);
 
         if (can_use_cache) {
-            TargetBitmapView valid_view(col_vec->GetValidRawData(),
-                                        col_vec_size);
             ExprResCacheManager::Key key{cache_segment->get_segment_id(),
                                          expr_cache_key_};
             ExprResCacheManager::Value v;
@@ -220,7 +246,10 @@ PhyFilterBitsNode::GetOutput() {
                       "PhyFilterBitsNode result should be ColumnVector");
         }
     }
-    bitset.flip();
+    TargetBitmapView bitset_view(bitset);
+    TargetBitmapView valid_bitset_view(valid_bitset);
+    ConvertPredicateToFilteredBitset(
+        bitset_view, valid_bitset_view, bitset.size());
 
     AssertInfo(bitset.size() == need_process_rows_,
                "bitset size: {}, need_process_rows_: {}",

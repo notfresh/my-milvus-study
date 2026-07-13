@@ -206,6 +206,36 @@ GetNotMatchExpr(SchemaPtr schema,
         std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, expr);
     return parsed;
 };
+
+std::shared_ptr<milvus::plan::FilterBitsNode>
+GetFuzzyMatchExpr(SchemaPtr schema,
+                  const std::string& query,
+                  int64_t max_edit_distance) {
+    // For TextMatchFuzzy the single extra value carries the max edit distance,
+    // reusing the slot phrase match uses for slop.
+    return GetMatchExpr(
+        schema, query, proto::plan::OpType::TextMatchFuzzy, max_edit_distance);
+};
+
+std::shared_ptr<milvus::plan::FilterBitsNode>
+GetFuzzyMatchExprNoDistance(SchemaPtr schema, const std::string& query) {
+    // A fuzzy plan with no extra value at all, to reach the executor's
+    // "max_edit_distance is required" guard.
+    const auto& str_meta = schema->operator[](FieldName("str"));
+    auto column_info = test::GenColumnInfo(str_meta.get_id().get(),
+                                           proto::schema::DataType::VarChar,
+                                           false,
+                                           false);
+    auto unary_range_expr =
+        test::GenUnaryRangeExpr(proto::plan::OpType::TextMatchFuzzy, query);
+    unary_range_expr->set_allocated_column_info(column_info);
+    auto expr = test::GenExpr();
+    expr->set_allocated_unary_range_expr(unary_range_expr);
+    auto parser = ProtoParser(schema);
+    auto typed_expr = parser.ParseExprs(*expr);
+    return std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID,
+                                                  typed_expr);
+};
 }  // namespace
 
 TEST(ParseJson, Naive) {
@@ -245,7 +275,8 @@ TEST(TextMatch, Index) {
     auto index = std::make_unique<Index>(std::numeric_limits<int64_t>::max(),
                                          "unique_id",
                                          "milvus_tokenizer",
-                                         "{}");
+                                         "{}",
+                                         /*enable_background_merge=*/false);
     index->CreateReader(milvus::index::SetBitsetSealed);
     index->AddTextSealed("football, basketball, pingpang", true, 0);
     index->AddTextSealed("", false, 1);
@@ -309,6 +340,53 @@ TEST(TextMatch, Index) {
         ASSERT_FALSE(res4[0]);
         ASSERT_FALSE(res4[1]);
         ASSERT_TRUE(res4[2]);
+    }
+}
+
+TEST(TextMatch, FuzzyIndex) {
+    using Index = index::TextMatchIndex;
+    auto index = std::make_unique<Index>(std::numeric_limits<int64_t>::max(),
+                                         "unique_id",
+                                         "milvus_tokenizer",
+                                         "{}",
+                                         /*enable_background_merge=*/false);
+    index->CreateReader(milvus::index::SetBitsetSealed);
+    index->AddTextSealed("football, basketball, pingpang", true, 0);
+    index->AddTextSealed("", false, 1);
+    index->AddTextSealed("swimming, football", true, 2);
+    index->Commit();
+    index->Reload();
+
+    {
+        // "footbal" is one edit from "football", so distance 1 matches rows 0 and 2.
+        auto res = index->FuzzyMatchQuery("footbal", 1);
+        ASSERT_EQ(res.size(), 3);
+        ASSERT_TRUE(res[0]);
+        ASSERT_FALSE(res[1]);
+        ASSERT_TRUE(res[2]);
+
+        // the same typo under exact text match finds nothing: fuzzy really differs.
+        auto exact = index->MatchQuery("footbal", 1);
+        ASSERT_EQ(exact.size(), 3);
+        ASSERT_FALSE(exact[0]);
+        ASSERT_FALSE(exact[2]);
+
+        // distance 0 is exact, so the typo still finds nothing.
+        auto res0 = index->FuzzyMatchQuery("footbal", 0);
+        ASSERT_EQ(res0.size(), 3);
+        ASSERT_FALSE(res0[0]);
+        ASSERT_FALSE(res0[2]);
+
+        // "fotbal" is two edits from "football": excluded at distance 1, matched at distance 2.
+        auto miss = index->FuzzyMatchQuery("fotbal", 1);
+        ASSERT_EQ(miss.size(), 3);
+        ASSERT_FALSE(miss[0]);
+        ASSERT_FALSE(miss[2]);
+        auto hit = index->FuzzyMatchQuery("fotbal", 2);
+        ASSERT_EQ(hit.size(), 3);
+        ASSERT_TRUE(hit[0]);
+        ASSERT_FALSE(hit[1]);
+        ASSERT_TRUE(hit[2]);
     }
 }
 
@@ -381,8 +459,11 @@ TEST(TextMatch, BuildIndexFromFieldDataMultiBatchNullable) {
 
     std::vector<milvus::FieldDataPtr> field_datas = {batch0, batch1, batch2};
 
-    auto index = std::make_unique<Index>(
-        200, "test_multi_batch", "milvus_tokenizer", "{}");
+    auto index = std::make_unique<Index>(200,
+                                         "test_multi_batch",
+                                         "milvus_tokenizer",
+                                         "{}",
+                                         /*enable_background_merge=*/true);
     index->CreateReader(milvus::index::SetBitsetGrowing);
     index->RegisterAnalyzer("milvus_tokenizer", "{}");
 
@@ -573,6 +654,121 @@ TEST(TextMatch, SealedCreateTextIndexDecodesTextLobRefs) {
     boost::filesystem::remove_all(TestLocalPath + test_dir);
 }
 
+TEST(TextMatch, GrowingBuildTextIndexFromTextLobRefsDecodesText) {
+    const FieldId text_field_id(101);
+    const std::string large_token = "zzgrowingloblarge";
+    const std::string second_batch_token = "zzgrowinglobbatch";
+    const std::string null_token = "zzgrowinglobnull";
+    constexpr int64_t row_count = 1030;
+
+    auto test_dir =
+        "growing_text_lob_index_" +
+        std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+    boost::filesystem::remove_all(TestLocalPath + test_dir);
+
+    auto schema = std::make_shared<Schema>();
+    schema->AddField(FieldMeta(
+        FieldName("pk"), FieldId(100), DataType::INT64, false, std::nullopt));
+    schema->set_primary_field_id(FieldId(100));
+    std::map<std::string, std::string> text_params = {
+        {"enable_match", "true"},
+        {"enable_analyzer", "true"},
+        {"analyzer_params", R"({"tokenizer": "standard"})"},
+    };
+    schema->AddField(FieldMeta(FieldName("str"),
+                               text_field_id,
+                               DataType::TEXT,
+                               65536,
+                               true,
+                               true,
+                               true,
+                               text_params,
+                               std::nullopt));
+
+    auto lob_base_path =
+        test_dir + "/lobs/" + std::to_string(text_field_id.get());
+    milvus_storage::lob_column::LobColumnConfig lob_config;
+    lob_config.lob_base_path = lob_base_path;
+    lob_config.field_id = text_field_id.get();
+    lob_config.inline_threshold = 1;
+    lob_config.max_lob_file_bytes = 256 * 1024;
+    lob_config.flush_threshold_bytes = 64 * 1024;
+    auto properties = milvus::storage::LoonFFIPropertiesSingleton::GetInstance()
+                          .GetProperties();
+    ASSERT_NE(properties, nullptr);
+    lob_config.properties = *properties;
+
+    auto fs = milvus::segcore::GetDefaultArrowFileSystem();
+    auto manager_result =
+        milvus_storage::lob_column::LobColumnManager::Create(fs, lob_config);
+    ASSERT_TRUE(manager_result.ok()) << manager_result.status().ToString();
+    auto manager = std::move(manager_result).ValueOrDie();
+    auto writer_result = manager->CreateWriter();
+    ASSERT_TRUE(writer_result.ok()) << writer_result.status().ToString();
+    auto writer = std::move(writer_result).ValueOrDie();
+
+    std::vector<std::string> encoded_refs;
+    encoded_refs.reserve(row_count);
+    for (int64_t i = 0; i < row_count; ++i) {
+        std::string text = "plain growing text row " + std::to_string(i);
+        if (i == 3) {
+            text = std::string(72 * 1024, 'x') + " " + large_token;
+        } else if (i == 1025) {
+            text = "second batch decoded text " + second_batch_token;
+        } else if (i == 7) {
+            text = "invalid nullable row " + null_token;
+        }
+
+        auto ref_result = writer->WriteText(text);
+        ASSERT_TRUE(ref_result.ok()) << ref_result.status().ToString();
+        auto ref = std::move(ref_result).ValueOrDie();
+        ASSERT_EQ(ref.size(), milvus_storage::lob_column::LOB_REFERENCE_SIZE);
+        ASSERT_TRUE(milvus_storage::lob_column::IsLOBReference(ref.data()));
+        encoded_refs.emplace_back(reinterpret_cast<const char*>(ref.data()),
+                                  ref.size());
+    }
+    auto close_result = writer->Close();
+    ASSERT_TRUE(close_result.ok()) << close_result.status().ToString();
+    auto lob_files = std::move(close_result).ValueOrDie();
+    ASSERT_FALSE(lob_files.empty());
+
+    auto field_data =
+        storage::CreateFieldData(DataType::TEXT, DataType::NONE, true);
+    std::vector<bool> valids(row_count, true);
+    valids[7] = false;
+    std::vector<uint8_t> valid_bytes((row_count + 7) / 8, 0);
+    for (int64_t i = 0; i < row_count; ++i) {
+        if (valids[i]) {
+            valid_bytes[i >> 3] |= (1u << (i & 7));
+        }
+    }
+    field_data->FillFieldData(
+        encoded_refs.data(), valid_bytes.data(), row_count, 0);
+
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    auto* growing = dynamic_cast<SegmentGrowingImpl*>(segment.get());
+    ASSERT_NE(growing, nullptr);
+    growing->SetTextLobPathForTesting(text_field_id, lob_base_path);
+    growing->BuildTextIndexFromTextLobRefs(
+        text_field_id, {field_data}, 0, (*schema)[text_field_id]);
+
+    auto index_pin = growing->GetTextIndex(nullptr, text_field_id);
+    auto large_hits = index_pin.get()->MatchQuery(large_token, 1);
+    ASSERT_EQ(large_hits.size(), row_count);
+    EXPECT_TRUE(large_hits[3]);
+
+    auto second_batch_hits = index_pin.get()->MatchQuery(second_batch_token, 1);
+    ASSERT_EQ(second_batch_hits.size(), row_count);
+    EXPECT_TRUE(second_batch_hits[1025]);
+
+    auto null_hits = index_pin.get()->MatchQuery(null_token, 1);
+    ASSERT_EQ(null_hits.size(), row_count);
+    EXPECT_FALSE(null_hits[7]);
+
+    boost::filesystem::remove_all(TestLocalPath + test_dir);
+}
+
 // Regression test: BuildIndexFromFieldData with a single batch should still
 // work correctly (i == offset in this case, so the old bug was hidden).
 TEST(TextMatch, BuildIndexFromFieldDataSingleBatchNullable) {
@@ -593,8 +789,11 @@ TEST(TextMatch, BuildIndexFromFieldDataSingleBatchNullable) {
 
     std::vector<milvus::FieldDataPtr> field_datas = {fd};
 
-    auto index = std::make_unique<Index>(
-        200, "test_single_batch", "milvus_tokenizer", "{}");
+    auto index = std::make_unique<Index>(200,
+                                         "test_single_batch",
+                                         "milvus_tokenizer",
+                                         "{}",
+                                         /*enable_background_merge=*/true);
     index->CreateReader(milvus::index::SetBitsetGrowing);
     index->RegisterAnalyzer("milvus_tokenizer", "{}");
 
@@ -710,6 +909,33 @@ TEST(TextMatch, GrowingNaive) {
         ASSERT_EQ(final.size(), N);
         ASSERT_TRUE(final[0]);
         ASSERT_FALSE(final[1]);
+    }
+
+    {
+        // A typo (edit distance 1) matches the same rows as the exact term and
+        // exercises the executor + growing commit/reload path for fuzzy match.
+        BitsetType final;
+        auto expr = GetFuzzyMatchExpr(schema, "footbal", 1);
+        final = ExecuteQueryExpr(expr, seg.get(), N, MAX_TIMESTAMP);
+        ASSERT_EQ(final.size(), N);
+        ASSERT_TRUE(final[0]);
+        ASSERT_TRUE(final[1]);
+        auto expr1 =
+            GetNotMatchExpr(schema, "footbal", OpType::TextMatchFuzzy, 1);
+        final = ExecuteQueryExpr(expr1, seg.get(), N, MAX_TIMESTAMP);
+        ASSERT_EQ(final.size(), N);
+        ASSERT_FALSE(final[0]);
+        ASSERT_FALSE(final[1]);
+    }
+
+    {
+        // The executor rejects an out-of-range or missing max_edit_distance
+        // (the parser guarantees [0, 2], but a raw proto may not).
+        auto bad = GetFuzzyMatchExpr(schema, "footbal", 3);
+        ASSERT_ANY_THROW(ExecuteQueryExpr(bad, seg.get(), N, MAX_TIMESTAMP));
+        auto missing = GetFuzzyMatchExprNoDistance(schema, "footbal");
+        ASSERT_ANY_THROW(
+            ExecuteQueryExpr(missing, seg.get(), N, MAX_TIMESTAMP));
     }
 }
 
@@ -969,6 +1195,23 @@ TEST(TextMatch, SealedNaive) {
         final = ExecuteQueryExpr(expr3, seg.get(), N, MAX_TIMESTAMP);
         ASSERT_EQ(final.size(), N);
         ASSERT_TRUE(final[0]);
+        ASSERT_FALSE(final[1]);
+    }
+
+    {
+        // A typo (edit distance 1) matches the same rows as the exact term,
+        // exercising the executor dispatch for fuzzy on a sealed segment.
+        BitsetType final;
+        auto expr = GetFuzzyMatchExpr(schema, "footbal", 1);
+        final = ExecuteQueryExpr(expr, seg.get(), N, MAX_TIMESTAMP);
+        ASSERT_EQ(final.size(), N);
+        ASSERT_TRUE(final[0]);
+        ASSERT_TRUE(final[1]);
+        auto expr1 =
+            GetNotMatchExpr(schema, "footbal", OpType::TextMatchFuzzy, 1);
+        final = ExecuteQueryExpr(expr1, seg.get(), N, MAX_TIMESTAMP);
+        ASSERT_EQ(final.size(), N);
+        ASSERT_FALSE(final[0]);
         ASSERT_FALSE(final[1]);
     }
 }
@@ -1517,6 +1760,7 @@ TEST(TextMatch, ConcurrentReadWriteWithNull) {
     for (int64_t i = 0; i < N - 1; i++) {
         str_col_valid->at(i) = false;
     }
+    str_col_valid->at(N - 1) = true;
 
     std::thread writer([&seg, &raw_data, N]() {
         seg->PreInsert(N);
@@ -1532,7 +1776,7 @@ TEST(TextMatch, ConcurrentReadWriteWithNull) {
         ;
         const std::chrono::seconds timeout_duration{2};
         while (true) {
-            if (start - std::chrono::high_resolution_clock::now() >
+            if (std::chrono::high_resolution_clock::now() - start >
                 timeout_duration) {
                 ASSERT_TRUE(false)
                     << "Failed to get valid results within timeout";
@@ -1647,11 +1891,13 @@ TEST(TextMatch, ExprResCacheFilterBitsDoesNotDuplicateTextMatchEntry) {
     ExprResCacheManager::Key filter_key{seg->get_segment_id(),
                                         expr->ToString()};
     ExprResCacheManager::Value filter_value;
+    filter_value.active_count = N;
     ASSERT_TRUE(mgr.Get(filter_key, filter_value));
 
     ExprResCacheManager::Key text_match_key{seg->get_segment_id(),
                                             expr->filter()->ToString()};
     ExprResCacheManager::Value text_match_value;
+    text_match_value.active_count = N;
     ASSERT_FALSE(mgr.Get(text_match_key, text_match_value));
 
     mgr.Clear();

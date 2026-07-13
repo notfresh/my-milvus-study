@@ -147,6 +147,12 @@ class SegmentGrowingImpl : public SegmentGrowing {
                                   size_t reserved_offset,
                                   const FieldMeta& field_meta);
 
+    // Test-only: inject TEXT LOB base path.
+    void
+    SetTextLobPathForTesting(FieldId field_id, std::string lob_base_path) {
+        text_lob_paths_[field_id] = std::move(lob_base_path);
+    }
+
     void
     Reopen(SchemaPtr sch) override;
 
@@ -166,6 +172,13 @@ class SegmentGrowingImpl : public SegmentGrowing {
     void
     Load(milvus::tracer::TraceContext& trace_ctx,
          milvus::OpContext* op_ctx = nullptr) override;
+
+    // Backfill fields that exist in the schema but had no data to load,
+    // e.g. fields added by AddField after the loaded binlogs were written.
+    // Nullable vector fields get their validity bitmap filled so queries
+    // observe all-null values instead of an uninitialized column.
+    void
+    FillAbsentFields();
 
  private:
     // Build geometry cache for inserted data
@@ -763,6 +776,9 @@ class SegmentGrowingImpl : public SegmentGrowing {
     void
     CreateTextIndexes();
 
+    std::unique_ptr<index::TextMatchIndex>
+    BuildTextIndexForMeta(const FieldMeta& field_meta);
+
     /**
      * @brief Initialize TEXT LOB spillover files for each TEXT field
      *
@@ -815,7 +831,8 @@ class SegmentGrowingImpl : public SegmentGrowing {
     LoadColumnGroup(
         const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
         const std::shared_ptr<milvus_storage::api::Properties>& properties,
-        int64_t index);
+        int64_t index,
+        int64_t row_limit);
 
     void
     InitializeArrayOffsets();

@@ -31,6 +31,9 @@ import (
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/session"
 	"github.com/milvus-io/milvus/internal/metastore"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
+	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/taskcommon"
@@ -46,6 +49,7 @@ type stubCatalog struct {
 	jobs            []*datapb.ExternalCollectionRefreshJob
 	tasks           []*datapb.ExternalCollectionRefreshTask
 	alterSegmentErr error
+	alteredSegments []*datapb.SegmentInfo
 }
 
 func (s *stubCatalog) ListExternalCollectionRefreshJobs(ctx context.Context) ([]*datapb.ExternalCollectionRefreshJob, error) {
@@ -73,6 +77,7 @@ func (s *stubCatalog) DropExternalCollectionRefreshTask(ctx context.Context, tas
 }
 
 func (s *stubCatalog) AlterSegments(ctx context.Context, newSegments []*datapb.SegmentInfo, binlogs ...metastore.BinlogsIncrement) error {
+	s.alteredSegments = append([]*datapb.SegmentInfo(nil), newSegments...)
 	return s.alterSegmentErr
 }
 
@@ -553,6 +558,49 @@ func TestRefreshExternalCollectionTask_SetJobInfo(t *testing.T) {
 		assert.Equal(t, commonpb.SegmentState_Flushed, newSegment.GetState())
 		assert.Equal(t, "by-dev-rootcoord-dml_0_v1", newSegment.GetInsertChannel())
 		assert.Equal(t, int64(1), newSegment.GetPartitionID())
+	})
+
+	t.Run("success_update_existing_segment_manifest", func(t *testing.T) {
+		catalog := &stubCatalog{}
+		refreshMeta, err := newExternalCollectionRefreshMeta(ctx, catalog)
+		assert.NoError(t, err)
+
+		segments := NewSegmentsInfo()
+		segments.SetSegment(1, &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:             1,
+				CollectionID:   100,
+				PartitionID:    1,
+				InsertChannel:  "by-dev-rootcoord-dml_0_v1",
+				State:          commonpb.SegmentState_Flushed,
+				NumOfRows:      500,
+				ManifestPath:   "old-manifest",
+				StorageVersion: 3,
+			},
+		})
+
+		mt := &meta{
+			catalog:     catalog,
+			segments:    segments,
+			collections: newTestCollections(100),
+		}
+
+		task := createTestRefreshTaskWithMetaAndStubs(t, 1001, 1, 100, mt, refreshMeta)
+		updated := newTestExternalRefreshSegment(1, 100, 500)
+		updated.ManifestPath = "new-manifest"
+		resp := &datapb.RefreshExternalCollectionTaskResponse{
+			UpdatedSegments: []*datapb.SegmentInfo{updated},
+		}
+
+		err = task.SetJobInfo(ctx, resp)
+		assert.NoError(t, err)
+		segment := mt.segments.GetSegment(1)
+		assert.NotNil(t, segment)
+		assert.Equal(t, commonpb.SegmentState_Flushed, segment.GetState())
+		assert.Equal(t, "new-manifest", segment.GetManifestPath())
+		assert.Equal(t, uint64(0), segment.GetDroppedAt())
+		assert.Len(t, catalog.alteredSegments, 1)
+		assert.Equal(t, int64(1), catalog.alteredSegments[0].GetID())
 	})
 
 	t.Run("high_drop_ratio_warning", func(t *testing.T) {
@@ -1544,6 +1592,64 @@ func TestApplyExternalCollectionSegmentUpdate_UpsertExistingSegment(t *testing.T
 	assert.Equal(t, `{"base_path":"old","ver":2}`, got.GetManifestPath())
 	assert.Equal(t, int32(4), got.GetSchemaVersion())
 	assert.ElementsMatch(t, []int64{100, 101, 102, 103}, got.GetBinlogs()[0].GetChildFields())
+}
+
+func TestApplyExternalRefreshPatchClearsStatsPlaceholders(t *testing.T) {
+	oldManifest := packed.MarshalManifestPath("files/insert_log/100/200/300", 1)
+	newManifest := packed.MarshalManifestPath("files/insert_log/100/200/300", 2)
+
+	oldSeg := &SegmentInfo{
+		SegmentInfo: &datapb.SegmentInfo{
+			ID:             300,
+			CollectionID:   100,
+			PartitionID:    200,
+			NumOfRows:      1000,
+			ManifestPath:   oldManifest,
+			StorageVersion: storage.StorageV3,
+			SchemaVersion:  1,
+			TextStatsLogs: map[int64]*datapb.TextIndexStats{
+				500: {
+					FieldID: 500,
+					Version: 1,
+					BuildID: 10,
+					Files:   []string{"files/insert_log/100/200/300/_stats/text_index.500/tokenizer.json"},
+				},
+			},
+			JsonKeyStats: map[int64]*datapb.JsonKeyStats{
+				500: {
+					FieldID:                500,
+					Version:                1,
+					BuildID:                10,
+					Files:                  []string{"shared_key_index/.managed.json_0"},
+					JsonKeyStatsDataFormat: common.JSONStatsDataFormatVersion,
+				},
+			},
+		},
+	}
+	incoming := &datapb.SegmentInfo{
+		ID:             300,
+		CollectionID:   100,
+		PartitionID:    200,
+		NumOfRows:      1000,
+		ManifestPath:   newManifest,
+		StorageVersion: storage.StorageV3,
+		SchemaVersion:  2,
+		Binlogs: []*datapb.FieldBinlog{{
+			FieldID:     0,
+			ChildFields: []int64{100, 500},
+			Binlogs: []*datapb.Binlog{{
+				LogID:      300,
+				EntriesNum: 1000,
+				MemorySize: 4096,
+				LogSize:    4096,
+			}},
+		}},
+	}
+
+	patched := applyExternalRefreshPatch(oldSeg, incoming)
+	assert.Equal(t, newManifest, patched.GetManifestPath())
+	assert.Empty(t, patched.GetTextStatsLogs())
+	assert.Empty(t, patched.GetJsonKeyStats())
 }
 
 func TestApplyExternalCollectionSegmentUpdate_RejectPatchRowCountChange(t *testing.T) {

@@ -47,6 +47,7 @@ const (
 	spGroupBy         = `group_by_field`
 	spGroupSize       = `group_size`
 	spStrictGroupSize = `strict_group_size`
+	spOrderByFields   = `order_by_fields`
 )
 
 type SearchOption interface {
@@ -59,6 +60,7 @@ type searchOption struct {
 	annRequest                 *AnnRequest
 	collectionName             string
 	partitionNames             []string
+	namespace                  *string
 	outputFields               []string
 	searchAggregation          *SearchAggregation
 	consistencyLevel           entity.ConsistencyLevel
@@ -333,6 +335,7 @@ func (opt *searchOption) Request() (*milvuspb.SearchRequest, error) {
 
 	request.CollectionName = opt.collectionName
 	request.PartitionNames = opt.partitionNames
+	request.Namespace = opt.namespace
 	request.ConsistencyLevel = commonpb.ConsistencyLevel(opt.consistencyLevel)
 	request.UseDefaultConsistency = opt.useDefaultConsistencyLevel
 	request.OutputFields = opt.outputFields
@@ -364,6 +367,11 @@ func (opt *searchOption) Request() (*milvuspb.SearchRequest, error) {
 
 func (opt *searchOption) WithPartitions(partitionNames ...string) *searchOption {
 	opt.partitionNames = partitionNames
+	return opt
+}
+
+func (opt *searchOption) WithNamespace(namespace string) *searchOption {
+	opt.namespace = &namespace
 	return opt
 }
 
@@ -525,6 +533,7 @@ type HybridSearchOption interface {
 type hybridSearchOption struct {
 	collectionName string
 	partitionNames []string
+	namespace      *string
 
 	reqs []*AnnRequest
 
@@ -551,6 +560,11 @@ func (opt *hybridSearchOption) WithPartitons(partitions ...string) *hybridSearch
 
 func (opt *hybridSearchOption) WithPartitions(partitions ...string) *hybridSearchOption {
 	opt.partitionNames = partitions
+	return opt
+}
+
+func (opt *hybridSearchOption) WithNamespace(namespace string) *hybridSearchOption {
+	opt.namespace = &namespace
 	return opt
 }
 
@@ -596,6 +610,7 @@ func (opt *hybridSearchOption) HybridRequest() (*milvuspb.HybridSearchRequest, e
 	r := &milvuspb.HybridSearchRequest{
 		CollectionName:        opt.collectionName,
 		PartitionNames:        opt.partitionNames,
+		Namespace:             opt.namespace,
 		Requests:              requests,
 		UseDefaultConsistency: opt.useDefaultConsistency,
 		ConsistencyLevel:      commonpb.ConsistencyLevel(opt.consistencyLevel),
@@ -629,6 +644,7 @@ type QueryOption interface {
 type queryOption struct {
 	collectionName             string
 	partitionNames             []string
+	namespace                  *string
 	queryParams                map[string]string
 	outputFields               []string
 	consistencyLevel           entity.ConsistencyLevel
@@ -641,6 +657,7 @@ func (opt *queryOption) Request() (*milvuspb.QueryRequest, error) {
 	req := &milvuspb.QueryRequest{
 		CollectionName: opt.collectionName,
 		PartitionNames: opt.partitionNames,
+		Namespace:      opt.namespace,
 		OutputFields:   opt.outputFields,
 
 		Expr:                  opt.expr,
@@ -687,6 +704,17 @@ func (opt *queryOption) WithLimit(limit int) *queryOption {
 	return opt
 }
 
+// WithOrderByFields sorts query results by the given scalar fields.
+// Each spec is "fieldName" or "fieldName:asc" / "fieldName:desc" (default asc).
+// The server requires an explicit limit when order-by fields are set.
+func (opt *queryOption) WithOrderByFields(fields ...string) *queryOption {
+	if opt.queryParams == nil {
+		opt.queryParams = make(map[string]string)
+	}
+	opt.queryParams[spOrderByFields] = strings.Join(fields, ",")
+	return opt
+}
+
 func (opt *queryOption) WithOutputFields(fieldNames ...string) *queryOption {
 	opt.outputFields = fieldNames
 	return opt
@@ -700,6 +728,11 @@ func (opt *queryOption) WithConsistencyLevel(consistencyLevel entity.Consistency
 
 func (opt *queryOption) WithPartitions(partitionNames ...string) *queryOption {
 	opt.partitionNames = partitionNames
+	return opt
+}
+
+func (opt *queryOption) WithNamespace(namespace string) *queryOption {
+	opt.namespace = &namespace
 	return opt
 }
 

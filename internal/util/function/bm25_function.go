@@ -20,18 +20,15 @@ package function
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
-	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/analyzer"
 	"github.com/milvus-io/milvus/pkg/v3/config"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -50,7 +47,7 @@ func getAnalyzerPoolSize() int {
 	cpuNum := hardware.GetCPUNum()
 	poolSize := int(float64(cpuNum) * paramtable.Get().FunctionCfg.AnalyzerConcurrencyPerCPUCore.GetAsFloat())
 	if poolSize <= 0 {
-		log.Warn("analyzer pool size is not positive, set to cpu num", zap.Int("cpuNum", cpuNum))
+		mlog.Warn(context.TODO(), "analyzer pool size is not positive, set to cpu num", mlog.Int("cpuNum", cpuNum))
 		poolSize = cpuNum
 	}
 	return poolSize
@@ -64,18 +61,18 @@ func initAnalyzerPool() {
 }
 
 func resizeAnalyzerPool(pool *conc.Pool[struct{}], newSize int) {
-	log := log.Ctx(context.Background()).With(zap.Int("newSize", newSize))
+	logger := mlog.With(mlog.Int("newSize", newSize))
 
 	if newSize <= 0 {
-		log.Warn("cannot set analyzer pool size to non-positive value")
+		logger.Warn(context.TODO(), "cannot set analyzer pool size to non-positive value")
 		return
 	}
 
 	if err := pool.Resize(newSize); err != nil {
-		log.Warn("failed to resize analyzer pool", zap.Error(err))
+		logger.Warn(context.TODO(), "failed to resize analyzer pool", mlog.Err(err))
 		return
 	}
-	log.Info("analyzer pool resize successfully")
+	logger.Info(context.TODO(), "analyzer pool resize successfully")
 }
 
 func ResizeAnalyzerPool(evt *config.Event) {
@@ -137,7 +134,7 @@ func NewAnalyzerRunner(field *schemapb.FieldSchema) (Analyzer, error) {
 
 func NewBM25FunctionRunner(coll *schemapb.CollectionSchema, schema *schemapb.FunctionSchema) (FunctionRunner, error) {
 	if len(schema.GetOutputFieldIds()) != 1 {
-		return nil, fmt.Errorf("bm25 function should only have one output field, but now %d", len(schema.GetOutputFieldIds()))
+		return nil, merr.WrapErrParameterInvalidMsg("bm25 function should only have one output field, but now %d", len(schema.GetOutputFieldIds()))
 	}
 
 	var inputField, outputField *schemapb.FieldSchema
@@ -153,7 +150,7 @@ func NewBM25FunctionRunner(coll *schemapb.CollectionSchema, schema *schemapb.Fun
 	}
 
 	if outputField == nil {
-		return nil, errors.New("no output field")
+		return nil, merr.WrapErrParameterInvalidMsg("no output field")
 	}
 
 	if params, ok := getMultiAnalyzerParams(inputField); ok {
@@ -192,13 +189,13 @@ func (v *BM25FunctionRunner) run(data []string, dst []map[uint32]float32) error 
 		}
 		embeddingMap := map[uint32]float32{}
 		tokenStream := tokenizer.NewTokenStream(data[i])
-		defer tokenStream.Destroy()
 		for tokenStream.Advance() {
 			token := tokenStream.Token()
 			// TODO More Hash Option
 			hash := typeutil.HashString2LessUint32(token)
 			embeddingMap[hash] += 1
 		}
+		tokenStream.Destroy()
 		dst[i] = embeddingMap
 	}
 	return nil
@@ -209,16 +206,16 @@ func (v *BM25FunctionRunner) BatchRun(inputs ...any) ([]any, error) {
 	defer v.mu.RUnlock()
 
 	if v.closed {
-		return nil, errors.New("analyzer receview request after function closed")
+		return nil, merr.WrapErrServiceInternalMsg("analyzer receview request after function closed")
 	}
 
 	if len(inputs) > 1 {
-		return nil, errors.New("BM25 function received more than one input column")
+		return nil, merr.WrapErrParameterInvalidMsg("BM25 function received more than one input column")
 	}
 
 	text, ok := inputs[0].([]string)
 	if !ok {
-		return nil, errors.New("BM25 function batch input not string list")
+		return nil, merr.WrapErrParameterInvalidMsg("BM25 function batch input not string list")
 	}
 
 	rowNum := len(text)
@@ -266,7 +263,6 @@ func (v *BM25FunctionRunner) analyze(data []string, dst [][]*milvuspb.AnalyzerTo
 	for i := 0; i < len(data); i++ {
 		result := []*milvuspb.AnalyzerToken{}
 		tokenStream := tokenizer.NewTokenStream(data[i])
-		defer tokenStream.Destroy()
 		for tokenStream.Advance() {
 			var token *milvuspb.AnalyzerToken
 			if withDetail {
@@ -282,6 +278,7 @@ func (v *BM25FunctionRunner) analyze(data []string, dst [][]*milvuspb.AnalyzerTo
 			}
 			result = append(result, token)
 		}
+		tokenStream.Destroy()
 		dst[i] = result
 	}
 	return nil
@@ -292,16 +289,16 @@ func (v *BM25FunctionRunner) BatchAnalyze(withDetail bool, withHash bool, inputs
 	defer v.mu.RUnlock()
 
 	if v.closed {
-		return nil, errors.New("analyzer receview request after function closed")
+		return nil, merr.WrapErrServiceInternalMsg("analyzer receview request after function closed")
 	}
 
 	if len(inputs) > 1 {
-		return nil, errors.New("analyze received should only receive text input column(not set analyzer name)")
+		return nil, merr.WrapErrParameterInvalidMsg("analyze received should only receive text input column(not set analyzer name)")
 	}
 
 	text, ok := inputs[0].([]string)
 	if !ok {
-		return nil, errors.New("batch input not string list")
+		return nil, merr.WrapErrParameterInvalidMsg("batch input not string list")
 	}
 
 	rowNum := len(text)

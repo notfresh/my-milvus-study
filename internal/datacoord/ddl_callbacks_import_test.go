@@ -107,8 +107,9 @@ func (s *ImportCallbacksSuite) TestValidateImportRequest_MaxJobsExceededReturnsE
 	err := server.validateImportRequest(ctx, files, options)
 
 	s.Error(err)
-	// ValidateMaxImportJobExceed returns WrapErrImportFailed, not ErrServiceQuotaExceeded
-	s.True(errors.Is(err, merr.ErrImportFailed))
+	// Job-count backpressure is a server-side condition -> ErrImportSysFailed
+	// (must not be bucketed as fail_input).
+	s.True(errors.Is(err, merr.ErrImportSysFailed))
 	s.Contains(err.Error(), "The number of jobs has reached the limit")
 }
 
@@ -185,7 +186,7 @@ func (s *ImportCallbacksSuite) TestValidateImportRequest_ReplicatingClusterRetur
 	err := server.validateImportRequest(ctx, files, options)
 
 	s.Error(err)
-	s.True(errors.Is(err, merr.ErrImportFailed))
+	s.True(errors.Is(err, merr.ErrOperationNotSupported))
 	s.Contains(err.Error(), "replicating cluster")
 }
 
@@ -230,7 +231,7 @@ func (s *ImportCallbacksSuite) TestValidateImportRequest_ReplicatingClusterEnabl
 		{Key: "timeout", Value: "300s"},
 	})
 	s.Error(err)
-	s.True(errors.Is(err, merr.ErrImportFailed))
+	s.True(errors.Is(err, merr.ErrOperationNotSupported))
 	s.Contains(err.Error(), "auto_commit=true")
 
 	err = server.validateImportRequest(ctx, files, []*commonpb.KeyValuePair{
@@ -943,6 +944,61 @@ func TestCommitImportCallback_UncommittedToCommitting(t *testing.T) {
 	assert.Equal(t, internalpb.ImportJobState_Committing, updatedJob.GetState())
 }
 
+func TestCommitImportCallback_BeforeUncommitted_Retry(t *testing.T) {
+	ctx := context.Background()
+	importMeta, _ := newTestImportMeta(t)
+
+	job := &importJob{
+		ImportJob: &datapb.ImportJob{
+			JobID:      11,
+			State:      internalpb.ImportJobState_Importing,
+			AutoCommit: false,
+		},
+		tr: timerecord.NewTimeRecorder("test"),
+	}
+	err := importMeta.AddJob(ctx, job)
+	assert.NoError(t, err)
+
+	callbacks := &DDLCallbacks{Server: &Server{importMeta: importMeta}}
+	err = callbacks.commitImportV2AckCallback(ctx, buildCommitImportBroadcastResult(11))
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, merr.ErrImportSysFailed))
+
+	updatedJob := importMeta.GetJob(ctx, 11)
+	assert.NotNil(t, updatedJob)
+	assert.Equal(t, internalpb.ImportJobState_Importing, updatedJob.GetState())
+}
+
+func TestCommitImportCallback_RetryAfterUncommitted(t *testing.T) {
+	ctx := context.Background()
+	importMeta, _ := newTestImportMeta(t)
+
+	job := &importJob{
+		ImportJob: &datapb.ImportJob{
+			JobID:      12,
+			State:      internalpb.ImportJobState_Importing,
+			AutoCommit: false,
+		},
+		tr: timerecord.NewTimeRecorder("test"),
+	}
+	err := importMeta.AddJob(ctx, job)
+	assert.NoError(t, err)
+
+	callbacks := &DDLCallbacks{Server: &Server{importMeta: importMeta}}
+	err = callbacks.commitImportV2AckCallback(ctx, buildCommitImportBroadcastResult(12))
+	assert.Error(t, err)
+
+	err = importMeta.UpdateJob(ctx, 12, UpdateJobState(internalpb.ImportJobState_Uncommitted))
+	assert.NoError(t, err)
+
+	err = callbacks.commitImportV2AckCallback(ctx, buildCommitImportBroadcastResult(12))
+	assert.NoError(t, err)
+
+	updatedJob := importMeta.GetJob(ctx, 12)
+	assert.NotNil(t, updatedJob)
+	assert.Equal(t, internalpb.ImportJobState_Committing, updatedJob.GetState())
+}
+
 func TestRollbackImportCallback_TransitionToFailed(t *testing.T) {
 	ctx := context.Background()
 	importMeta, _ := newTestImportMeta(t)
@@ -968,6 +1024,7 @@ func TestRollbackImportCallback_TransitionToFailed(t *testing.T) {
 	updatedJob := importMeta.GetJob(ctx, 2)
 	assert.NotNil(t, updatedJob)
 	assert.Equal(t, internalpb.ImportJobState_Failed, updatedJob.GetState())
+	assert.Equal(t, "aborted by user", updatedJob.GetReason())
 	// UpdateJobState(Failed) also releases disk quota and arms GC eligibility.
 	assert.EqualValues(t, 0, updatedJob.GetRequestedDiskSize(),
 		"Failed transition must release RequestedDiskSize")
@@ -1159,7 +1216,8 @@ func testBroadcastRequiresVchannels(t *testing.T, broadcastFn func(*Server, cont
 
 	err := broadcastFn(server, ctx, job)
 	assert.Error(t, err)
-	assert.True(t, errors.Is(err, merr.ErrImportFailed))
+	// Missing vchannels is internal broadcast state -> ErrImportSysFailed.
+	assert.True(t, errors.Is(err, merr.ErrImportSysFailed))
 	assert.Contains(t, err.Error(), "job 7 has no vchannels")
 }
 

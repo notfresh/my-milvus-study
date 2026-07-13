@@ -28,7 +28,6 @@ import (
 	"github.com/tidwall/gjson"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
@@ -37,10 +36,11 @@ import (
 	"github.com/milvus-io/milvus/internal/proxy/search_agg"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/function/chain"
+	chaintypes "github.com/milvus-io/milvus/internal/util/function/chain/types"
 	"github.com/milvus-io/milvus/internal/util/function/models"
 	"github.com/milvus-io/milvus/internal/util/segcore"
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
@@ -76,7 +76,7 @@ type Node struct {
 func (n *Node) unpackInputs(msg opMsg) ([]any, error) {
 	for _, input := range n.inputs {
 		if _, ok := msg[input]; !ok {
-			return nil, merr.WrapErrServiceInternal(fmt.Sprintf("Node [%s]'s input %s not found", n.name, input))
+			return nil, merr.WrapErrServiceInternalMsg("Node [%s]'s input %s not found", n.name, input)
 		}
 	}
 	inputs := make([]any, len(n.inputs))
@@ -89,7 +89,7 @@ func (n *Node) unpackInputs(msg opMsg) ([]any, error) {
 func (n *Node) packOutputs(outputs []any, srcMsg opMsg) (opMsg, error) {
 	msg := srcMsg
 	if len(outputs) != len(n.outputs) {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("Node [%s] output size not match operator output size", n.name))
+		return nil, merr.WrapErrServiceInternalMsg("Node [%s] output size not match operator output size", n.name)
 	}
 	for i, output := range n.outputs {
 		msg[output] = outputs[i]
@@ -180,17 +180,23 @@ type searchReduceOperator struct {
 	isSearchAggregation bool
 }
 
-func newSearchReduceOperator(t *searchTask, _ map[string]any) (operator, error) {
+const reduceOffsetParamKey = "reduce_offset"
+
+func newSearchReduceOperator(t *searchTask, params map[string]any) (operator, error) {
 	pkField, err := t.schema.GetPkField()
 	if err != nil {
 		return nil, err
+	}
+	offset := t.GetOffset()
+	if v, ok := params[reduceOffsetParamKey].(int64); ok {
+		offset = v
 	}
 	return &searchReduceOperator{
 		traceCtx:            t.TraceCtx(),
 		primaryFieldSchema:  pkField,
 		nq:                  t.GetNq(),
 		topK:                t.GetTopk(),
-		offset:              t.GetOffset(),
+		offset:              offset,
 		collectionID:        t.GetCollectionID(),
 		partitionIDs:        t.GetPartitionIDs(),
 		queryInfos:          t.queryInfos,
@@ -331,7 +337,7 @@ func (op *elementBestCollapseOperator) run(ctx context.Context, span trace.Span,
 		return nil, merr.WrapErrParameterInvalidMsg("element best collapse: inputs[1] must be []string, got %T", inputs[1])
 	}
 	if len(metrics) != len(results) {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element best collapse: metrics length (%d) does not match results length (%d)", len(metrics), len(results)))
+		return nil, merr.WrapErrServiceInternalMsg("element best collapse: metrics length (%d) does not match results length (%d)", len(metrics), len(results))
 	}
 
 	collapsed := make([]*milvuspb.SearchResults, len(results))
@@ -351,7 +357,7 @@ func (op *elementBestCollapseOperator) run(ctx context.Context, span trace.Span,
 				totalRows += topk
 			}
 			if totalRows > 0 {
-				return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element best collapse: missing metric type for element-level result[%d]", i))
+				return nil, merr.WrapErrServiceInternalMsg("element best collapse: missing metric type for element-level result[%d]", i)
 			}
 		}
 		var err error
@@ -359,7 +365,7 @@ func (op *elementBestCollapseOperator) run(ctx context.Context, span trace.Span,
 		if i < len(op.configs) && op.configs[i].Strategy != "" {
 			config = op.configs[i]
 		}
-		collapsed[i], err = collapseElementLevelResult(result, metric.PositivelyRelated(metricType), config)
+		collapsed[i], err = collapseElementLevelResultByMetricType(result, metricType, config)
 		if err != nil {
 			return nil, err
 		}
@@ -404,13 +410,17 @@ func collapseElementLevelResultByBestScore(result *milvuspb.SearchResults, large
 }
 
 func collapseElementLevelResult(result *milvuspb.SearchResults, largerScoreIsBetter bool, config elementCollapseConfig) (*milvuspb.SearchResults, error) {
+	return collapseElementLevelResultWithMetricDirection(result, largerScoreIsBetter, true, config)
+}
+
+func collapseElementLevelResultByMetricType(result *milvuspb.SearchResults, metricType string, config elementCollapseConfig) (*milvuspb.SearchResults, error) {
+	metricType = strings.TrimSpace(metricType)
+	return collapseElementLevelResultWithMetricDirection(result, metric.PositivelyRelated(metricType), metricType != "", config)
+}
+
+func collapseElementLevelResultWithMetricDirection(result *milvuspb.SearchResults, largerScoreIsBetter bool, metricKnown bool, config elementCollapseConfig) (*milvuspb.SearchResults, error) {
 	if result == nil || result.GetResults() == nil || result.GetResults().GetElementIndices() == nil {
 		return result, nil
-	}
-	if isElementCollapseSumFamily(config.Strategy) && !largerScoreIsBetter {
-		return nil, merr.WrapErrParameterInvalidMsg(
-			"%s.collapse.strategy %s is only supported for positively related metrics",
-			elementScopeKey, config.Strategy)
 	}
 
 	data := result.GetResults()
@@ -418,6 +428,12 @@ func collapseElementLevelResult(result *milvuspb.SearchResults, largerScoreIsBet
 	totalRows := int64(0)
 	for _, topk := range topks {
 		totalRows += topk
+	}
+
+	if isElementCollapseSumFamily(config.Strategy) && metricKnown && !largerScoreIsBetter {
+		return nil, merr.WrapErrParameterInvalidMsg(
+			"%s.collapse.strategy %s is only supported for positively related metrics",
+			elementScopeKey, config.Strategy)
 	}
 	if totalRows == 0 {
 		return copySearchResultsWithData(result, &schemapb.SearchResultData{
@@ -433,25 +449,29 @@ func collapseElementLevelResult(result *milvuspb.SearchResults, largerScoreIsBet
 		}), nil
 	}
 
+	if !metricKnown {
+		return nil, merr.WrapErrServiceInternal("element best collapse: missing metric type for element-level result")
+	}
+
 	if typeutil.GetSizeOfIDs(data.GetIds()) < int(totalRows) {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element best collapse: ids length (%d) is less than total rows (%d)",
-			typeutil.GetSizeOfIDs(data.GetIds()), totalRows))
+		return nil, merr.WrapErrServiceInternalMsg("element best collapse: ids length (%d) is less than total rows (%d)",
+			typeutil.GetSizeOfIDs(data.GetIds()), totalRows)
 	}
 	if int64(len(data.GetScores())) < totalRows {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element best collapse: scores length (%d) is less than total rows (%d)",
-			len(data.GetScores()), totalRows))
+		return nil, merr.WrapErrServiceInternalMsg("element best collapse: scores length (%d) is less than total rows (%d)",
+			len(data.GetScores()), totalRows)
 	}
 	if int64(len(data.GetElementIndices().GetData())) < totalRows {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element best collapse: element_indices length (%d) is less than total rows (%d)",
-			len(data.GetElementIndices().GetData()), totalRows))
+		return nil, merr.WrapErrServiceInternalMsg("element best collapse: element_indices length (%d) is less than total rows (%d)",
+			len(data.GetElementIndices().GetData()), totalRows)
 	}
 	if len(data.GetDistances()) > 0 && int64(len(data.GetDistances())) < totalRows {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element best collapse: distances length (%d) is less than total rows (%d)",
-			len(data.GetDistances()), totalRows))
+		return nil, merr.WrapErrServiceInternalMsg("element best collapse: distances length (%d) is less than total rows (%d)",
+			len(data.GetDistances()), totalRows)
 	}
 	if len(data.GetRecalls()) > 0 && int64(len(data.GetRecalls())) < totalRows {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element best collapse: recalls length (%d) is less than total rows (%d)",
-			len(data.GetRecalls()), totalRows))
+		return nil, merr.WrapErrServiceInternalMsg("element best collapse: recalls length (%d) is less than total rows (%d)",
+			len(data.GetRecalls()), totalRows)
 	}
 
 	output := &schemapb.SearchResultData{
@@ -561,7 +581,7 @@ func aggregateElementHits(hits []bestElementHit, config elementCollapseConfig, l
 		for _, hit := range hits {
 			sum += hit.score
 		}
-		selected := hits[0]
+		selected := bestHits[0]
 		selected.aggregate = sum
 		selected.groupCount = len(hits)
 		if config.Strategy == elementCollapseAvg {
@@ -615,6 +635,8 @@ func prepareElementLevelHybridResult(result *milvuspb.SearchResults) (*milvuspb.
 			AllSearchCount:          data.GetAllSearchCount(),
 			PrimaryFieldName:        data.GetPrimaryFieldName(),
 			ElementIndices:          &schemapb.LongArray{},
+			GroupByFieldValues:      append([]*schemapb.FieldData(nil), data.GetGroupByFieldValues()...),
+			GroupByFieldValue:       data.GetGroupByFieldValue(),
 			SearchIteratorV2Results: data.GetSearchIteratorV2Results(),
 		}
 		if len(data.GetDistances()) > 0 {
@@ -626,15 +648,15 @@ func prepareElementLevelHybridResult(result *milvuspb.SearchResults) (*milvuspb.
 		return copySearchResultsWithData(result, output), nil
 	}
 	if typeutil.GetSizeOfIDs(data.GetIds()) < int(totalRows) {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element-level hybrid: ids length (%d) is less than total rows (%d)",
-			typeutil.GetSizeOfIDs(data.GetIds()), totalRows))
+		return nil, merr.WrapErrServiceInternalMsg("element-level hybrid: ids length (%d) is less than total rows (%d)",
+			typeutil.GetSizeOfIDs(data.GetIds()), totalRows)
 	}
 	if data.GetElementIndices() == nil {
 		return nil, merr.WrapErrServiceInternal("element-level hybrid: missing element_indices")
 	}
 	if int64(len(data.GetElementIndices().GetData())) < totalRows {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element-level hybrid: element_indices length (%d) is less than total rows (%d)",
-			len(data.GetElementIndices().GetData()), totalRows))
+		return nil, merr.WrapErrServiceInternalMsg("element-level hybrid: element_indices length (%d) is less than total rows (%d)",
+			len(data.GetElementIndices().GetData()), totalRows)
 	}
 
 	keys := make([]string, 0, totalRows)
@@ -652,6 +674,8 @@ func prepareElementLevelHybridResult(result *milvuspb.SearchResults) (*milvuspb.
 		AllSearchCount:          data.GetAllSearchCount(),
 		PrimaryFieldName:        data.GetPrimaryFieldName(),
 		ElementIndices:          data.GetElementIndices(),
+		GroupByFieldValues:      append([]*schemapb.FieldData(nil), data.GetGroupByFieldValues()...),
+		GroupByFieldValue:       data.GetGroupByFieldValue(),
 		SearchIteratorV2Results: data.GetSearchIteratorV2Results(),
 	}
 	if len(data.GetDistances()) > 0 {
@@ -719,11 +743,11 @@ func restoreElementLevelHybridRankResult(rankResult *milvuspb.SearchResults) (*m
 		rawKey := typeutil.GetPK(data.GetIds(), int64(i))
 		key, ok := rawKey.(string)
 		if !ok {
-			return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element key restore: expected string element key, got %T", rawKey))
+			return nil, merr.WrapErrServiceInternalMsg("element key restore: expected string element key, got %T", rawKey)
 		}
 		pk, elementIndex, ok := parseHybridElementKey(key)
 		if !ok {
-			return nil, merr.WrapErrServiceInternal(fmt.Sprintf("element key restore: invalid element key %q", key))
+			return nil, merr.WrapErrServiceInternalMsg("element key restore: invalid element key %q", key)
 		}
 		appendPK(outputIDs, pk)
 		elementIndices = append(elementIndices, elementIndex)
@@ -740,6 +764,8 @@ func restoreElementLevelHybridRankResult(rankResult *milvuspb.SearchResults) (*m
 		AllSearchCount:          data.GetAllSearchCount(),
 		PrimaryFieldName:        data.GetPrimaryFieldName(),
 		ElementIndices:          &schemapb.LongArray{Data: elementIndices},
+		GroupByFieldValues:      append([]*schemapb.FieldData(nil), data.GetGroupByFieldValues()...),
+		GroupByFieldValue:       data.GetGroupByFieldValue(),
 		SearchIteratorV2Results: data.GetSearchIteratorV2Results(),
 	}
 	if len(data.GetDistances()) > 0 {
@@ -810,7 +836,7 @@ func (op *aggregateOperator) run(ctx context.Context, span trace.Span, inputs ..
 	}
 	reducedList, ok := inputs[0].([]*milvuspb.SearchResults)
 	if !ok {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("aggregateOperator: expected []*milvuspb.SearchResults, got %T (pipeline wire)", inputs[0]))
+		return nil, merr.WrapErrServiceInternalMsg("aggregateOperator: expected []*milvuspb.SearchResults, got %T (pipeline wire)", inputs[0])
 	}
 	// Upstream searchReduceOp has already done cross-shard composite-key reduce
 	// and produced a single *milvuspb.SearchResults wrapping one SearchResultData.
@@ -1165,10 +1191,16 @@ func buildChainFromMeta(
 	switch m := meta.(type) {
 	case *funcScoreRerankMeta:
 		return chain.BuildRerankChain(collSchema, m.funcScore, metrics, searchParams, alloc)
+	case *functionChainRerankMeta:
+		buildCtx := chaintypes.FunctionBuildContext{}
+		if searchParams != nil {
+			buildCtx.ModelExtraInfo = searchParams.ModelExtraInfo
+		}
+		return chain.FuncChainFromReprWithContext(m.repr, alloc, buildCtx)
 	case *legacyRerankMeta:
 		return chain.BuildRerankChainWithLegacy(collSchema, m.legacyParams, metrics, searchParams, alloc)
 	default:
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("rerank operator: unsupported rerankMeta type %T", meta))
+		return nil, merr.WrapErrFunctionFailedMsg("rerank operator: unsupported rerankMeta type %T", meta)
 	}
 }
 
@@ -1255,7 +1287,7 @@ func (op *rerankOperator) run(ctx context.Context, span trace.Span, inputs ...an
 		for _, df := range dataframes {
 			df.Release()
 		}
-		return nil, merr.WrapErrServiceInternal("rerank operator: rerankMeta is nil, cannot build rerank chain")
+		return nil, merr.WrapErrFunctionFailedMsg("rerank operator: rerankMeta is nil, cannot build rerank chain")
 	}
 	searchParams.ModelExtraInfo = &models.ModelExtraInfo{
 		ClusterID: paramtable.Get().CommonCfg.ClusterPrefix.GetValue(),
@@ -1269,8 +1301,17 @@ func (op *rerankOperator) run(ctx context.Context, span trace.Span, inputs ...an
 		return nil, err
 	}
 
-	// Execute chain
-	resultDF, err := fc.ExecuteWithContext(ctx, dataframes...)
+	// Execute chain. Column pruning is an execution optimization only;
+	// final response projection is still handled by the end operator.
+	resultDF, err := fc.ExecuteWithOptions(ctx, chain.ExecuteOptions{
+		EnableColumnPruning: true,
+		Downstream: chain.DownstreamSpec{
+			RequiredColumns: neededFields,
+		},
+		SystemColumnPolicy: chain.SystemColumnPolicy{
+			KeepAllSystemColumns: true,
+		},
+	}, dataframes...)
 	// Release input dataframes
 	for _, df := range dataframes {
 		df.Release()
@@ -1316,6 +1357,7 @@ type requeryOperator struct {
 	consistencyLevel   commonpb.ConsistencyLevel
 	guaranteeTimestamp uint64
 	namespace          *string
+	planNamespace      *string
 
 	node types.ProxyComponent
 }
@@ -1367,6 +1409,7 @@ func newRequeryOperator(t *searchTask, _ map[string]any) (operator, error) {
 		partitionIDs:       t.GetPartitionIDs(),
 		node:               t.node,
 		namespace:          t.request.Namespace,
+		planNamespace:      namespaceForPlan(t.schema.CollectionSchema, t.request.Namespace),
 	}, nil
 }
 
@@ -1404,7 +1447,7 @@ func (op *requeryOperator) requery(ctx context.Context, span trace.Span, ids *sc
 		Namespace:             op.namespace,
 	}
 	plan := planparserv2.CreateRequeryPlan(op.primaryFieldSchema, ids)
-	plan.Namespace = op.namespace
+	plan.Namespace = op.planNamespace
 	channelsMvcc := make(map[string]Timestamp)
 	for k, v := range op.queryChannelsTs {
 		channelsMvcc[k] = v
@@ -1435,6 +1478,7 @@ func (op *requeryOperator) requery(ctx context.Context, span trace.Span, ids *sc
 		preferredNodes: preferredNodes,
 		fastSkip:       true,
 		reQuery:        true,
+		chMgr:          op.node.(*Proxy).chMgr,
 	}
 	queryResult, storageCost, err := op.node.(*Proxy).query(op.traceCtx, qt, span)
 	if err != nil {
@@ -1661,7 +1705,7 @@ func (op *hybridAssembleOperator) run(ctx context.Context, span trace.Span, inpu
 		if op.elementLevelHybrid {
 			elementIndices := rankResult.GetResults().GetElementIndices().GetData()
 			if i >= len(elementIndices) {
-				return nil, merr.WrapErrServiceInternal(fmt.Sprintf("hybrid assemble: missing element index for reranked row %d, collection=%d", i, op.collectionID))
+				return nil, merr.WrapErrServiceInternalMsg("hybrid assemble: missing element index for reranked row %d, collection=%d", i, op.collectionID)
 			}
 			candidateKey = makeHybridElementKey(candidateKey, elementIndices[i])
 		}
@@ -1671,10 +1715,10 @@ func (op *hybridAssembleOperator) run(ctx context.Context, span trace.Span, inpu
 				fmt.Sprintf("hybrid assemble: missing id %v, collection=%d", candidateKey, op.collectionID))
 		}
 		if computers[loc.resultIdx] == nil {
-			return nil, merr.WrapErrServiceInternal(fmt.Sprintf(
+			return nil, merr.WrapErrServiceInternalMsg(
 				"hybrid assemble: sub-result[%d] has empty FieldsData but contributed reranked id %v; "+
 					"all sub-results that contribute ids must share the same FieldsData layout, "+
-					"collection=%d", loc.resultIdx, candidateKey, op.collectionID))
+					"collection=%d", loc.resultIdx, candidateKey, op.collectionID)
 		}
 		locs[i] = loc
 		itemsByResult[loc.resultIdx] = append(itemsByResult[loc.resultIdx], rowIdxComputeItem{
@@ -1765,6 +1809,8 @@ type orderByOperator struct {
 	orderByFields  []OrderByField
 	groupByFieldId int64
 	groupSize      int64
+	limit          int64
+	offset         int64
 }
 
 func newOrderByOperator(t *searchTask, _ map[string]any) (operator, error) {
@@ -1782,6 +1828,8 @@ func newOrderByOperator(t *searchTask, _ map[string]any) (operator, error) {
 		orderByFields:  t.orderByFields,
 		groupByFieldId: groupByFieldId,
 		groupSize:      groupSize,
+		limit:          t.GetTopk() - t.GetOffset(),
+		offset:         t.GetOffset(),
 	}, nil
 }
 
@@ -1790,12 +1838,13 @@ func (op *orderByOperator) run(ctx context.Context, span trace.Span, inputs ...a
 	defer sp.End()
 
 	result := inputs[0].(*milvuspb.SearchResults)
+	resultData := result.GetResults()
 
 	if len(op.orderByFields) == 0 {
 		return []any{result}, nil
 	}
 
-	numResults := len(result.GetResults().GetScores())
+	numResults := len(resultData.GetScores())
 	if numResults == 0 {
 		return []any{result}, nil
 	}
@@ -1807,7 +1856,7 @@ func (op *orderByOperator) run(ctx context.Context, span trace.Span, inputs ...a
 
 	// Get per-query result counts from Topks
 	// Topks[i] contains the number of results for the i-th query
-	topks := result.GetResults().GetTopks()
+	topks := resultData.GetTopks()
 
 	// Validate that sum(Topks) matches numResults to prevent slice bounds panic
 	var sumTopks int64
@@ -1815,7 +1864,7 @@ func (op *orderByOperator) run(ctx context.Context, span trace.Span, inputs ...a
 		sumTopks += topk
 	}
 	if int(sumTopks) != numResults {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("order_by: Topks sum (%d) does not match numResults (%d)", sumTopks, numResults))
+		return nil, merr.WrapErrServiceInternalMsg("order_by: Topks sum (%d) does not match numResults (%d)", sumTopks, numResults)
 	}
 
 	// Build indices array for sorting
@@ -1824,50 +1873,76 @@ func (op *orderByOperator) run(ctx context.Context, span trace.Span, inputs ...a
 		indices[i] = i
 	}
 
-	// Sort results per query - each query's results should be sorted independently
-	// Results are stored sequentially: [q1_results..., q2_results..., ...]
-	if len(topks) <= 1 {
-		// Single query (nq=1) or no topks info - sort all results together
-		if err := op.sortQueryResults(result, indices); err != nil {
-			return nil, err
-		}
-	} else {
-		// Multiple queries (nq>1) - sort each query's results independently
-		offset := 0
-		for _, topk := range topks {
-			if topk > 0 {
-				// Extract the slice of indices for this query
-				queryIndices := indices[offset : offset+int(topk)]
-				if err := op.sortQueryResults(result, queryIndices); err != nil {
-					return nil, err
-				}
+	selectedIndices := make([]int, 0, numResults)
+	newTopks := make([]int64, 0, len(topks))
+	queryOffset := 0
+	for _, topk := range topks {
+		queryIndices := indices[queryOffset : queryOffset+int(topk)]
+		if topk > 0 {
+			var err error
+			queryIndices, err = op.sortQueryResults(result, queryIndices)
+			if err != nil {
+				return nil, err
 			}
-			offset += int(topk)
 		}
+		selectedIndices = append(selectedIndices, queryIndices...)
+		newTopks = append(newTopks, int64(len(queryIndices)))
+		queryOffset += int(topk)
 	}
 
-	// Reorder results based on sorted indices
-	if err := op.reorderResults(result, indices); err != nil {
+	if err := op.reorderResults(result, selectedIndices); err != nil {
 		return nil, err
 	}
+
+	var maxTopK int64
+	for _, topk := range newTopks {
+		if topk > maxTopK {
+			maxTopK = topk
+		}
+	}
+	resultData.Topks = newTopks
+	resultData.TopK = maxTopK
 
 	return []any{result}, nil
 }
 
+func getOrderByGroupByFieldValue(resultData *schemapb.SearchResultData) *schemapb.FieldData {
+	if resultData == nil {
+		return nil
+	}
+	if gbvs := resultData.GetGroupByFieldValues(); len(gbvs) > 0 {
+		return gbvs[0]
+	}
+	return resultData.GetGroupByFieldValue()
+}
+
+func paginateSortedRows(indices []int, offset, limit int64) []int {
+	start := int(offset)
+	if start > len(indices) {
+		start = len(indices)
+	}
+	end := len(indices)
+	if limit > 0 && start+int(limit) < end {
+		end = start + int(limit)
+	}
+	return indices[start:end]
+}
+
 // sortQueryResults sorts the given indices slice based on order_by fields.
 // This handles both regular and group-by cases for a single query's results.
-// Returns an error if comparison fails (e.g., index out of bounds).
-func (op *orderByOperator) sortQueryResults(result *milvuspb.SearchResults, indices []int) error {
+// Returns the sorted and paginated indices, or an error if comparison fails.
+func (op *orderByOperator) sortQueryResults(result *milvuspb.SearchResults, indices []int) ([]int, error) {
 	if len(indices) == 0 {
-		return nil
+		return indices, nil
 	}
 
 	if op.groupByFieldId >= 0 && op.groupSize > 0 {
-		// Group-by case: sort groups by the first row's value in each group
 		return op.sortGroupsByOrderByFields(result, indices)
 	}
-	// Regular case: sort all results
-	return op.sortResultsByOrderByFields(result, indices)
+	if err := op.sortResultsByOrderByFields(result, indices); err != nil {
+		return nil, err
+	}
+	return paginateSortedRows(indices, op.offset, op.limit), nil
 }
 
 // validateOrderByFields checks that all order_by fields exist in the result
@@ -1881,7 +1956,7 @@ func (op *orderByOperator) validateOrderByFields(result *milvuspb.SearchResults)
 
 	for _, orderBy := range op.orderByFields {
 		if !fieldNames[orderBy.FieldName] {
-			return merr.WrapErrServiceInternal(fmt.Sprintf("order_by field '%s' not found in search results", orderBy.FieldName))
+			return merr.WrapErrServiceInternalMsg("order_by field '%s' not found in search results", orderBy.FieldName)
 		}
 	}
 	return nil
@@ -2138,8 +2213,8 @@ func (op *orderByOperator) sortResultsByOrderByFields(result *milvuspb.SearchRes
 			if field == nil {
 				// This should never happen if validateOrderByFields passed.
 				// Log and skip rather than panic to avoid crashing on edge cases.
-				log.Warn("order_by field not found in fieldMap after validation, skipping",
-					zap.String("fieldName", orderBy.FieldName))
+				mlog.Warn(context.TODO(), "order_by field not found in fieldMap after validation, skipping",
+					mlog.String("fieldName", orderBy.FieldName))
 				continue
 			}
 			cmp, err := compareOrderByField(field, orderBy, idxI, idxJ, cache)
@@ -2168,23 +2243,19 @@ func (op *orderByOperator) sortResultsByOrderByFields(result *milvuspb.SearchRes
 // This invariant is guaranteed by the upstream search/reduce pipeline which groups results before
 // returning them. If this invariant is violated (e.g., [A, B, A] instead of [A, A, B]), the function
 // will treat non-contiguous occurrences as separate groups and produce incorrect ordering.
-func (op *orderByOperator) sortGroupsByOrderByFields(result *milvuspb.SearchResults, indices []int) error {
+func (op *orderByOperator) sortGroupsByOrderByFields(result *milvuspb.SearchResults, indices []int) ([]int, error) {
 	numResults := len(indices)
 	if numResults == 0 {
-		return nil
+		return indices, nil
 	}
 
-	// All internal pipeline stages emit to the plural channel. The task
-	// output boundary downgrades to singular for legacy-wire SDK clients,
-	// which runs after orderBy, so this reader sees plural only. orderBy
-	// inspects column 0 because orderBy + multi-field composite key is not
-	// a pipeline combination constructed today.
-	gbvs := result.GetResults().GetGroupByFieldValues()
-	if len(gbvs) == 0 {
-		// No group by field value, fall back to regular sort
-		return op.sortResultsByOrderByFields(result, indices)
+	groupByValue := getOrderByGroupByFieldValue(result.GetResults())
+	if groupByValue == nil {
+		if err := op.sortResultsByOrderByFields(result, indices); err != nil {
+			return nil, err
+		}
+		return paginateSortedRows(indices, op.offset, op.limit), nil
 	}
-	groupByValue := gbvs[0]
 
 	// Find group boundaries by detecting when GroupByFieldValue changes
 	// Each group is represented as [startLocalIdx, endLocalIdx) - indices into the 'indices' slice
@@ -2224,8 +2295,8 @@ func (op *orderByOperator) sortGroupsByOrderByFields(result *milvuspb.SearchResu
 			if field == nil {
 				// This should never happen if validateOrderByFields passed.
 				// Log and skip rather than panic to avoid crashing on edge cases.
-				log.Warn("order_by field not found in fieldMap after validation, skipping",
-					zap.String("fieldName", orderBy.FieldName))
+				mlog.Warn(context.TODO(), "order_by field not found in fieldMap after validation, skipping",
+					mlog.String("fieldName", orderBy.FieldName))
 				continue
 			}
 			cmp, err := compareOrderByField(field, orderBy, dataIdxI, dataIdxJ, cache)
@@ -2240,19 +2311,20 @@ func (op *orderByOperator) sortGroupsByOrderByFields(result *milvuspb.SearchResu
 		return false
 	})
 	if sortErr != nil {
-		return sortErr
+		return nil, sortErr
 	}
 
-	// Rebuild indices array based on sorted groups
-	// Collect actual data indices in the new sorted order
-	newIndices := make([]int, 0, numResults)
-	for _, g := range groups {
-		for localIdx := g.start; localIdx < g.end; localIdx++ {
-			newIndices = append(newIndices, indices[localIdx])
+	selected := make([]int, 0, numResults)
+	for groupIdx, g := range groups {
+		if int64(groupIdx) < op.offset {
+			continue
 		}
+		if op.limit > 0 && int64(groupIdx) >= op.offset+op.limit {
+			break
+		}
+		selected = append(selected, indices[g.start:g.end]...)
 	}
-	copy(indices, newIndices)
-	return nil
+	return selected, nil
 }
 
 // isSameGroupByValue checks if two indices have the same group by value.
@@ -2305,7 +2377,7 @@ func compareFieldDataAt(field *schemapb.FieldData, i, j int, nullsFirst bool) (i
 	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32:
 		data := field.GetScalars().GetIntData().GetData()
 		if i >= len(data) || j >= len(data) {
-			return 0, merr.WrapErrServiceInternal(fmt.Sprintf("compareFieldDataAt: index out of bounds for Int field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data)))
+			return 0, merr.WrapErrServiceInternalMsg("compareFieldDataAt: index out of bounds for Int field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data))
 		}
 		if data[i] < data[j] {
 			return -1, nil
@@ -2316,7 +2388,7 @@ func compareFieldDataAt(field *schemapb.FieldData, i, j int, nullsFirst bool) (i
 	case schemapb.DataType_Int64:
 		data := field.GetScalars().GetLongData().GetData()
 		if i >= len(data) || j >= len(data) {
-			return 0, merr.WrapErrServiceInternal(fmt.Sprintf("compareFieldDataAt: index out of bounds for Int64 field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data)))
+			return 0, merr.WrapErrServiceInternalMsg("compareFieldDataAt: index out of bounds for Int64 field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data))
 		}
 		if data[i] < data[j] {
 			return -1, nil
@@ -2327,7 +2399,7 @@ func compareFieldDataAt(field *schemapb.FieldData, i, j int, nullsFirst bool) (i
 	case schemapb.DataType_Float:
 		data := field.GetScalars().GetFloatData().GetData()
 		if i >= len(data) || j >= len(data) {
-			return 0, merr.WrapErrServiceInternal(fmt.Sprintf("compareFieldDataAt: index out of bounds for Float field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data)))
+			return 0, merr.WrapErrServiceInternalMsg("compareFieldDataAt: index out of bounds for Float field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data))
 		}
 		if data[i] < data[j] {
 			return -1, nil
@@ -2338,7 +2410,7 @@ func compareFieldDataAt(field *schemapb.FieldData, i, j int, nullsFirst bool) (i
 	case schemapb.DataType_Double:
 		data := field.GetScalars().GetDoubleData().GetData()
 		if i >= len(data) || j >= len(data) {
-			return 0, merr.WrapErrServiceInternal(fmt.Sprintf("compareFieldDataAt: index out of bounds for Double field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data)))
+			return 0, merr.WrapErrServiceInternalMsg("compareFieldDataAt: index out of bounds for Double field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data))
 		}
 		if data[i] < data[j] {
 			return -1, nil
@@ -2349,7 +2421,7 @@ func compareFieldDataAt(field *schemapb.FieldData, i, j int, nullsFirst bool) (i
 	case schemapb.DataType_VarChar, schemapb.DataType_String:
 		data := field.GetScalars().GetStringData().GetData()
 		if i >= len(data) || j >= len(data) {
-			return 0, merr.WrapErrServiceInternal(fmt.Sprintf("compareFieldDataAt: index out of bounds for String field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data)))
+			return 0, merr.WrapErrServiceInternalMsg("compareFieldDataAt: index out of bounds for String field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data))
 		}
 		if data[i] < data[j] {
 			return -1, nil
@@ -2362,13 +2434,13 @@ func compareFieldDataAt(field *schemapb.FieldData, i, j int, nullsFirst bool) (i
 		// not by semantic JSON value. For example, "2" > "10" because '2' > '1' in bytes.
 		data := field.GetScalars().GetJsonData().GetData()
 		if i >= len(data) || j >= len(data) {
-			return 0, merr.WrapErrServiceInternal(fmt.Sprintf("compareFieldDataAt: index out of bounds for JSON field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data)))
+			return 0, merr.WrapErrServiceInternalMsg("compareFieldDataAt: index out of bounds for JSON field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data))
 		}
 		return bytes.Compare(data[i], data[j]), nil
 	case schemapb.DataType_Bool:
 		data := field.GetScalars().GetBoolData().GetData()
 		if i >= len(data) || j >= len(data) {
-			return 0, merr.WrapErrServiceInternal(fmt.Sprintf("compareFieldDataAt: index out of bounds for Bool field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data)))
+			return 0, merr.WrapErrServiceInternalMsg("compareFieldDataAt: index out of bounds for Bool field %s (i=%d, j=%d, len=%d)", field.GetFieldName(), i, j, len(data))
 		}
 		// false < true
 		if !data[i] && data[j] {
@@ -2378,7 +2450,7 @@ func compareFieldDataAt(field *schemapb.FieldData, i, j int, nullsFirst bool) (i
 		}
 		return 0, nil
 	default:
-		return 0, merr.WrapErrServiceInternal(fmt.Sprintf("compareFieldDataAt: unsupported field type %s for field %s", field.GetType().String(), field.GetFieldName()))
+		return 0, merr.WrapErrServiceInternalMsg("compareFieldDataAt: unsupported field type %s for field %s", field.GetType().String(), field.GetFieldName())
 	}
 }
 
@@ -2387,39 +2459,95 @@ func (op *orderByOperator) reorderResults(result *milvuspb.SearchResults, indice
 	results := result.GetResults()
 	n := len(indices)
 
-	// Reorder IDs
+	var intIDs *schemapb.LongArray
+	var strIDs *schemapb.StringArray
+	var newIntIDs []int64
+	var newStrIDs []string
 	if ids := results.GetIds(); ids != nil {
-		if intIds := ids.GetIntId(); intIds != nil {
-			newData := make([]int64, n)
-			for newIdx, oldIdx := range indices {
-				if oldIdx < 0 || oldIdx >= len(intIds.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderResults: index %d out of bounds for int IDs (len=%d)", oldIdx, len(intIds.Data)))
-				}
-				newData[newIdx] = intIds.Data[oldIdx]
-			}
-			intIds.Data = newData
-		} else if strIds := ids.GetStrId(); strIds != nil {
-			newData := make([]string, n)
-			for newIdx, oldIdx := range indices {
-				if oldIdx < 0 || oldIdx >= len(strIds.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderResults: index %d out of bounds for string IDs (len=%d)", oldIdx, len(strIds.Data)))
-				}
-				newData[newIdx] = strIds.Data[oldIdx]
-			}
-			strIds.Data = newData
+		if intIDData := ids.GetIntId(); intIDData != nil {
+			intIDs = intIDData
+			newIntIDs = make([]int64, n)
+		} else if strIDData := ids.GetStrId(); strIDData != nil {
+			strIDs = strIDData
+			newStrIDs = make([]string, n)
 		}
 	}
 
-	// Reorder scores
+	var newScores []float32
 	if len(results.Scores) > 0 {
-		newScores := make([]float32, n)
-		for newIdx, oldIdx := range indices {
+		newScores = make([]float32, n)
+	}
+	var newDistances []float32
+	if len(results.Distances) > 0 {
+		newDistances = make([]float32, n)
+	}
+	var newRecalls []float32
+	if len(results.Recalls) > 0 {
+		newRecalls = make([]float32, n)
+	}
+	var elemIndices *schemapb.LongArray
+	var newElementIndices []int64
+	if data := results.GetElementIndices(); data != nil && len(data.GetData()) > 0 {
+		elemIndices = data
+		newElementIndices = make([]int64, n)
+	}
+
+	for newIdx, oldIdx := range indices {
+		if intIDs != nil {
+			if oldIdx < 0 || oldIdx >= len(intIDs.Data) {
+				return merr.WrapErrServiceInternalMsg("reorderResults: index %d out of bounds for int IDs (len=%d)", oldIdx, len(intIDs.Data))
+			}
+			newIntIDs[newIdx] = intIDs.Data[oldIdx]
+		}
+		if strIDs != nil {
+			if oldIdx < 0 || oldIdx >= len(strIDs.Data) {
+				return merr.WrapErrServiceInternalMsg("reorderResults: index %d out of bounds for string IDs (len=%d)", oldIdx, len(strIDs.Data))
+			}
+			newStrIDs[newIdx] = strIDs.Data[oldIdx]
+		}
+		if newScores != nil {
 			if oldIdx < 0 || oldIdx >= len(results.Scores) {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderResults: index %d out of bounds for scores (len=%d)", oldIdx, len(results.Scores)))
+				return merr.WrapErrServiceInternalMsg("reorderResults: index %d out of bounds for scores (len=%d)", oldIdx, len(results.Scores))
 			}
 			newScores[newIdx] = results.Scores[oldIdx]
 		}
+		if newDistances != nil {
+			if oldIdx < 0 || oldIdx >= len(results.Distances) {
+				return merr.WrapErrServiceInternalMsg("reorderResults: index %d out of bounds for distances (len=%d)", oldIdx, len(results.Distances))
+			}
+			newDistances[newIdx] = results.Distances[oldIdx]
+		}
+		if newRecalls != nil {
+			if oldIdx < 0 || oldIdx >= len(results.Recalls) {
+				return merr.WrapErrServiceInternalMsg("reorderResults: index %d out of bounds for recalls (len=%d)", oldIdx, len(results.Recalls))
+			}
+			newRecalls[newIdx] = results.Recalls[oldIdx]
+		}
+		if newElementIndices != nil {
+			if oldIdx < 0 || oldIdx >= len(elemIndices.GetData()) {
+				return merr.WrapErrServiceInternalMsg("reorderResults: index %d out of bounds for element indices (len=%d)", oldIdx, len(elemIndices.GetData()))
+			}
+			newElementIndices[newIdx] = elemIndices.GetData()[oldIdx]
+		}
+	}
+
+	if intIDs != nil {
+		intIDs.Data = newIntIDs
+	}
+	if strIDs != nil {
+		strIDs.Data = newStrIDs
+	}
+	if newScores != nil {
 		results.Scores = newScores
+	}
+	if newDistances != nil {
+		results.Distances = newDistances
+	}
+	if newRecalls != nil {
+		results.Recalls = newRecalls
+	}
+	if newElementIndices != nil {
+		elemIndices.Data = newElementIndices
 	}
 
 	// Reorder field data
@@ -2429,9 +2557,7 @@ func (op *orderByOperator) reorderResults(result *milvuspb.SearchResults, indice
 		}
 	}
 
-	// Reorder every group-by column — all internal stages emit plural; the
-	// task output boundary handles legacy-wire singular downgrade after.
-	for _, gbv := range results.GetGroupByFieldValues() {
+	if gbv := getOrderByGroupByFieldValue(results); gbv != nil {
 		if err := reorderFieldData(gbv, indices); err != nil {
 			return err
 		}
@@ -2450,7 +2576,7 @@ func prepareNullableFieldDataReorder(field *schemapb.FieldData, indices []int) (
 	newValidData := make([]bool, len(indices))
 	for newIdx, oldIdx := range indices {
 		if oldIdx < 0 || oldIdx >= len(validData) {
-			return nil, nil, 0, merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for ValidData of field %s (len=%d)", oldIdx, field.GetFieldName(), len(validData)))
+			return nil, nil, 0, merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for ValidData of field %s (len=%d)", oldIdx, field.GetFieldName(), len(validData))
 		}
 		newValidData[newIdx] = validData[oldIdx]
 	}
@@ -2467,10 +2593,17 @@ func countValidRows(validData []bool) int {
 	return validCount
 }
 
+func validateReorderIndex(oldIdx, originalRows int, field *schemapb.FieldData) error {
+	if oldIdx < 0 || oldIdx >= originalRows {
+		return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for %s field %s (rows=%d)", oldIdx, field.GetType().String(), field.GetFieldName(), originalRows)
+	}
+	return nil
+}
+
 func reorderNullableFloatVectorData(field *schemapb.FieldData, data []float32, width int, indices []int, newValidData []bool, logicalToPhysical []int, validCount int) ([]float32, error) {
 	expected := validCount * width
 	if len(data) != expected {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: nullable FloatVector field %s has %d elements, expected compact %d (valid=%d, dim=%d)", field.GetFieldName(), len(data), expected, validCount, width))
+		return nil, merr.WrapErrServiceInternalMsg("reorderFieldData: nullable FloatVector field %s has %d elements, expected compact %d (valid=%d, dim=%d)", field.GetFieldName(), len(data), expected, validCount, width)
 	}
 	newData := make([]float32, 0, countValidRows(newValidData)*width)
 	for _, oldIdx := range indices {
@@ -2487,7 +2620,7 @@ func reorderNullableFloatVectorData(field *schemapb.FieldData, data []float32, w
 func reorderNullableByteVectorData(field *schemapb.FieldData, typeName string, data []byte, width int, indices []int, newValidData []bool, logicalToPhysical []int, validCount int) ([]byte, error) {
 	expected := validCount * width
 	if len(data) != expected {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: nullable %s field %s has %d bytes, expected compact %d (valid=%d, width=%d)", typeName, field.GetFieldName(), len(data), expected, validCount, width))
+		return nil, merr.WrapErrServiceInternalMsg("reorderFieldData: nullable %s field %s has %d bytes, expected compact %d (valid=%d, width=%d)", typeName, field.GetFieldName(), len(data), expected, validCount, width)
 	}
 	newData := make([]byte, 0, countValidRows(newValidData)*width)
 	for _, oldIdx := range indices {
@@ -2503,7 +2636,7 @@ func reorderNullableByteVectorData(field *schemapb.FieldData, typeName string, d
 
 func reorderNullableSparseVectorData(field *schemapb.FieldData, contents [][]byte, indices []int, newValidData []bool, logicalToPhysical []int, validCount int) ([][]byte, error) {
 	if len(contents) != validCount {
-		return nil, merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: nullable SparseFloatVector field %s has %d elements, expected compact %d", field.GetFieldName(), len(contents), validCount))
+		return nil, merr.WrapErrServiceInternalMsg("reorderFieldData: nullable SparseFloatVector field %s has %d elements, expected compact %d", field.GetFieldName(), len(contents), validCount)
 	}
 	newContents := make([][]byte, 0, countValidRows(newValidData))
 	for _, oldIdx := range indices {
@@ -2528,7 +2661,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			newData := make([]int32, n)
 			for newIdx, oldIdx := range indices {
 				if oldIdx < 0 || oldIdx >= len(data.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for %s field %s (len=%d)", oldIdx, field.GetType().String(), field.GetFieldName(), len(data.Data)))
+					return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for %s field %s (len=%d)", oldIdx, field.GetType().String(), field.GetFieldName(), len(data.Data))
 				}
 				newData[newIdx] = data.Data[oldIdx]
 			}
@@ -2539,7 +2672,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			newData := make([]int64, n)
 			for newIdx, oldIdx := range indices {
 				if oldIdx < 0 || oldIdx >= len(data.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for Int64 field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data)))
+					return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for Int64 field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data))
 				}
 				newData[newIdx] = data.Data[oldIdx]
 			}
@@ -2550,7 +2683,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			newData := make([]float32, n)
 			for newIdx, oldIdx := range indices {
 				if oldIdx < 0 || oldIdx >= len(data.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for Float field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data)))
+					return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for Float field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data))
 				}
 				newData[newIdx] = data.Data[oldIdx]
 			}
@@ -2561,7 +2694,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			newData := make([]float64, n)
 			for newIdx, oldIdx := range indices {
 				if oldIdx < 0 || oldIdx >= len(data.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for Double field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data)))
+					return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for Double field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data))
 				}
 				newData[newIdx] = data.Data[oldIdx]
 			}
@@ -2572,7 +2705,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			newData := make([]string, n)
 			for newIdx, oldIdx := range indices {
 				if oldIdx < 0 || oldIdx >= len(data.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for %s field %s (len=%d)", oldIdx, field.GetType().String(), field.GetFieldName(), len(data.Data)))
+					return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for %s field %s (len=%d)", oldIdx, field.GetType().String(), field.GetFieldName(), len(data.Data))
 				}
 				newData[newIdx] = data.Data[oldIdx]
 			}
@@ -2583,7 +2716,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			newData := make([]bool, n)
 			for newIdx, oldIdx := range indices {
 				if oldIdx < 0 || oldIdx >= len(data.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for Bool field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data)))
+					return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for Bool field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data))
 				}
 				newData[newIdx] = data.Data[oldIdx]
 			}
@@ -2594,7 +2727,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			newData := make([][]byte, n)
 			for newIdx, oldIdx := range indices {
 				if oldIdx < 0 || oldIdx >= len(data.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for JSON field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data)))
+					return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for JSON field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data))
 				}
 				newData[newIdx] = data.Data[oldIdx]
 			}
@@ -2605,7 +2738,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			newData := make([]*schemapb.ScalarField, n)
 			for newIdx, oldIdx := range indices {
 				if oldIdx < 0 || oldIdx >= len(data.Data) {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for Array field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data)))
+					return merr.WrapErrServiceInternalMsg("reorderFieldData: index %d out of bounds for Array field %s (len=%d)", oldIdx, field.GetFieldName(), len(data.Data))
 				}
 				newData[newIdx] = data.Data[oldIdx]
 			}
@@ -2616,7 +2749,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 		if vectors != nil && (newValidData != nil || vectors.GetFloatVector() != nil) {
 			dim := int(vectors.GetDim())
 			if dim <= 0 {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: invalid dimension %d for FloatVector field %s", dim, field.GetFieldName()))
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: invalid dimension %d for FloatVector field %s", dim, field.GetFieldName())
 			}
 			var data []float32
 			if vectors.GetFloatVector() != nil {
@@ -2630,13 +2763,14 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 				vectors.Data = &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: newData}}
 				break
 			}
-			if len(data) != n*dim {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: FloatVector field %s has %d elements, expected %d (n=%d, dim=%d)", field.GetFieldName(), len(data), n*dim, n, dim))
+			if len(data)%dim != 0 {
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: FloatVector field %s has %d elements not divisible by dim %d", field.GetFieldName(), len(data), dim)
 			}
+			originalRows := len(data) / dim
 			newData := make([]float32, n*dim)
 			for newIdx, oldIdx := range indices {
-				if oldIdx < 0 || oldIdx >= n {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for FloatVector field %s (n=%d)", oldIdx, field.GetFieldName(), n))
+				if err := validateReorderIndex(oldIdx, originalRows, field); err != nil {
+					return err
 				}
 				srcStart := oldIdx * dim
 				dstStart := newIdx * dim
@@ -2650,7 +2784,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			dim := int(vectors.GetDim())
 			bytesPerVector := dim / 8
 			if bytesPerVector <= 0 {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: invalid dimension %d for BinaryVector field %s", dim, field.GetFieldName()))
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: invalid dimension %d for BinaryVector field %s", dim, field.GetFieldName())
 			}
 			data := vectors.GetBinaryVector()
 			if newValidData != nil {
@@ -2661,13 +2795,14 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 				vectors.Data = &schemapb.VectorField_BinaryVector{BinaryVector: newData}
 				break
 			}
-			if len(data) != n*bytesPerVector {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: BinaryVector field %s has %d bytes, expected %d (n=%d, bytesPerVector=%d)", field.GetFieldName(), len(data), n*bytesPerVector, n, bytesPerVector))
+			if len(data)%bytesPerVector != 0 {
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: BinaryVector field %s has %d bytes not divisible by width %d", field.GetFieldName(), len(data), bytesPerVector)
 			}
+			originalRows := len(data) / bytesPerVector
 			newData := make([]byte, n*bytesPerVector)
 			for newIdx, oldIdx := range indices {
-				if oldIdx < 0 || oldIdx >= n {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for BinaryVector field %s (n=%d)", oldIdx, field.GetFieldName(), n))
+				if err := validateReorderIndex(oldIdx, originalRows, field); err != nil {
+					return err
 				}
 				srcStart := oldIdx * bytesPerVector
 				dstStart := newIdx * bytesPerVector
@@ -2680,7 +2815,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 		if vectors != nil && (newValidData != nil || len(vectors.GetFloat16Vector()) > 0) {
 			dim := int(vectors.GetDim())
 			if dim <= 0 {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: invalid dimension %d for Float16Vector field %s", dim, field.GetFieldName()))
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: invalid dimension %d for Float16Vector field %s", dim, field.GetFieldName())
 			}
 			bytesPerVector := dim * 2 // 2 bytes per float16
 			data := vectors.GetFloat16Vector()
@@ -2692,13 +2827,14 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 				vectors.Data = &schemapb.VectorField_Float16Vector{Float16Vector: newData}
 				break
 			}
-			if len(data) != n*bytesPerVector {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: Float16Vector field %s has %d bytes, expected %d (n=%d, bytesPerVector=%d)", field.GetFieldName(), len(data), n*bytesPerVector, n, bytesPerVector))
+			if len(data)%bytesPerVector != 0 {
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: Float16Vector field %s has %d bytes not divisible by width %d", field.GetFieldName(), len(data), bytesPerVector)
 			}
+			originalRows := len(data) / bytesPerVector
 			newData := make([]byte, n*bytesPerVector)
 			for newIdx, oldIdx := range indices {
-				if oldIdx < 0 || oldIdx >= n {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for Float16Vector field %s (n=%d)", oldIdx, field.GetFieldName(), n))
+				if err := validateReorderIndex(oldIdx, originalRows, field); err != nil {
+					return err
 				}
 				srcStart := oldIdx * bytesPerVector
 				dstStart := newIdx * bytesPerVector
@@ -2711,7 +2847,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 		if vectors != nil && (newValidData != nil || len(vectors.GetBfloat16Vector()) > 0) {
 			dim := int(vectors.GetDim())
 			if dim <= 0 {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: invalid dimension %d for BFloat16Vector field %s", dim, field.GetFieldName()))
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: invalid dimension %d for BFloat16Vector field %s", dim, field.GetFieldName())
 			}
 			bytesPerVector := dim * 2 // 2 bytes per bfloat16
 			data := vectors.GetBfloat16Vector()
@@ -2723,13 +2859,14 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 				vectors.Data = &schemapb.VectorField_Bfloat16Vector{Bfloat16Vector: newData}
 				break
 			}
-			if len(data) != n*bytesPerVector {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: BFloat16Vector field %s has %d bytes, expected %d (n=%d, bytesPerVector=%d)", field.GetFieldName(), len(data), n*bytesPerVector, n, bytesPerVector))
+			if len(data)%bytesPerVector != 0 {
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: BFloat16Vector field %s has %d bytes not divisible by width %d", field.GetFieldName(), len(data), bytesPerVector)
 			}
+			originalRows := len(data) / bytesPerVector
 			newData := make([]byte, n*bytesPerVector)
 			for newIdx, oldIdx := range indices {
-				if oldIdx < 0 || oldIdx >= n {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for BFloat16Vector field %s (n=%d)", oldIdx, field.GetFieldName(), n))
+				if err := validateReorderIndex(oldIdx, originalRows, field); err != nil {
+					return err
 				}
 				srcStart := oldIdx * bytesPerVector
 				dstStart := newIdx * bytesPerVector
@@ -2754,13 +2891,10 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 				vectors.Data = &schemapb.VectorField_SparseFloatVector{SparseFloatVector: sparseData}
 				break
 			}
-			if len(contents) != n {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: SparseFloatVector field %s has %d elements, expected %d", field.GetFieldName(), len(contents), n))
-			}
 			newContents := make([][]byte, n)
 			for newIdx, oldIdx := range indices {
-				if oldIdx < 0 || oldIdx >= n {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for SparseFloatVector field %s (n=%d)", oldIdx, field.GetFieldName(), n))
+				if err := validateReorderIndex(oldIdx, len(contents), field); err != nil {
+					return err
 				}
 				newContents[newIdx] = contents[oldIdx]
 			}
@@ -2771,7 +2905,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 		if vectors != nil && (newValidData != nil || len(vectors.GetInt8Vector()) > 0) {
 			dim := int(vectors.GetDim())
 			if dim <= 0 {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: invalid dimension %d for Int8Vector field %s", dim, field.GetFieldName()))
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: invalid dimension %d for Int8Vector field %s", dim, field.GetFieldName())
 			}
 			data := vectors.GetInt8Vector()
 			if newValidData != nil {
@@ -2782,13 +2916,14 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 				vectors.Data = &schemapb.VectorField_Int8Vector{Int8Vector: newData}
 				break
 			}
-			if len(data) != n*dim {
-				return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: Int8Vector field %s has %d bytes, expected %d (n=%d, dim=%d)", field.GetFieldName(), len(data), n*dim, n, dim))
+			if len(data)%dim != 0 {
+				return merr.WrapErrServiceInternalMsg("reorderFieldData: Int8Vector field %s has %d bytes not divisible by dim %d", field.GetFieldName(), len(data), dim)
 			}
+			originalRows := len(data) / dim
 			newData := make([]byte, n*dim)
 			for newIdx, oldIdx := range indices {
-				if oldIdx < 0 || oldIdx >= n {
-					return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: index %d out of bounds for Int8Vector field %s (n=%d)", oldIdx, field.GetFieldName(), n))
+				if err := validateReorderIndex(oldIdx, originalRows, field); err != nil {
+					return err
 				}
 				srcStart := oldIdx * dim
 				dstStart := newIdx * dim
@@ -2797,7 +2932,7 @@ func reorderFieldData(field *schemapb.FieldData, indices []int) error {
 			vectors.Data = &schemapb.VectorField_Int8Vector{Int8Vector: newData}
 		}
 	default:
-		return merr.WrapErrServiceInternal(fmt.Sprintf("reorderFieldData: unhandled data type %s", field.GetType().String()))
+		return merr.WrapErrServiceInternalMsg("reorderFieldData: unhandled data type %s", field.GetType().String())
 	}
 
 	// Reorder valid data if present
@@ -2876,17 +3011,17 @@ func (p *pipeline) AddNodes(t *searchTask, nodes ...*nodeDef) error {
 }
 
 func (p *pipeline) Run(ctx context.Context, span trace.Span, toReduceResults []*internalpb.SearchResults, storageCost segcore.StorageCost) (*milvuspb.SearchResults, segcore.StorageCost, error) {
-	log.Ctx(ctx).Debug("SearchPipeline run", zap.Stringer("pipeline", p))
+	mlog.Debug(ctx, "SearchPipeline run", mlog.Stringer("pipeline", p))
 	pTrace := newPipelineTrace(p.traceEnabled)
 	msg := opMsg{}
 	msg[pipelineInput] = toReduceResults
 	msg[pipelineStorageCost] = storageCost
 	for _, node := range p.nodes {
 		var err error
-		log.Ctx(ctx).Debug("SearchPipeline run node", zap.String("node", node.name))
+		mlog.Debug(ctx, "SearchPipeline run node", mlog.String("node", node.name))
 		msg, err = node.Run(ctx, span, msg)
 		if err != nil {
-			log.Ctx(ctx).Error("Run node failed: ", zap.String("err", err.Error()))
+			mlog.Error(ctx, "Run node failed: ", mlog.String("err", err.Error()))
 			return nil, storageCost, err
 		}
 		pTrace.TraceMsg(node.opName, msg)
@@ -3369,7 +3504,7 @@ var hybridSearchWithRequeryPipe = &pipelineDef{
 	},
 }
 
-// searchWithOrderByPipe: reduce → requery → organize → order_by
+// searchWithOrderByPipe: reduce without offset → requery → organize → order_by
 // For common search with order_by_fields
 var searchWithOrderByPipe = &pipelineDef{
 	name: "searchWithOrderBy",
@@ -3378,7 +3513,10 @@ var searchWithOrderByPipe = &pipelineDef{
 			name:    "reduce",
 			inputs:  []string{pipelineInput, pipelineStorageCost},
 			outputs: []string{"reduced", "metrics"},
-			opName:  searchReduceOp,
+			params: map[string]any{
+				reduceOffsetParamKey: int64(0),
+			},
+			opName: searchReduceOp,
 		},
 		{
 			name:    "merge",
@@ -3442,7 +3580,7 @@ func newBuiltInPipeline(t *searchTask) (*pipeline, error) {
 
 	hasOrderBy := len(t.orderByFields) > 0
 
-	// Common search with order_by: reduce → requery → order_by
+	// Common search with order_by: reduce without offset, then order and slice.
 	if !t.GetIsAdvanced() && hasOrderBy {
 		return newPipeline(searchWithOrderByPipe, t)
 	}

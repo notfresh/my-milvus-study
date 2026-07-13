@@ -36,6 +36,9 @@ const milvus::FieldId TimestampFieldID = milvus::FieldId(1);
 // Virtual field ID for two-project mode: carries segment offsets through
 // the pipeline so that deferred fields can be fetched after TopK.
 const milvus::FieldId SegmentOffsetFieldID = milvus::FieldId(-100);
+// Virtual field ID for element-level ORDER BY: carries the matched element
+// index alongside SegmentOffsetFieldID after TopK.
+const milvus::FieldId ElementIndexFieldID = milvus::FieldId(-101);
 
 // fill followed extra info to binlog file
 const char ORIGIN_SIZE_KEY[] = "original_size";
@@ -109,6 +112,7 @@ const std::string JSON_CAST_TYPE = "json_cast_type";
 const std::string JSON_PATH = "json_path";
 const std::string JSON_CAST_FUNCTION = "json_cast_function";
 const bool DEFAULT_OPTIMIZE_EXPR_ENABLED = true;
+const bool DEFAULT_ENABLE_DRIVER_PREFETCH = true;
 const int64_t DEFAULT_CONVERT_OR_TO_IN_NUMERIC_LIMIT = 150;
 const int64_t DEFAULT_JSON_INDEX_MEMORY_BUDGET = 16777216;  // bytes, 16MB
 const bool DEFAULT_JSON_KEY_STATS_ENABLED = true;
@@ -130,8 +134,10 @@ const std::string DATA_TYPE_KEY = "data_type";
 const std::string ELEMENT_TYPE_KEY = "element_type";
 const std::string INDEX_NUM_ROWS_KEY = "index_num_rows";
 const std::string SEGMENT_MANIFEST_KEY = "segment_manifest";
+const std::string EXTERNAL_SPEC_KEY = "external_spec";
 const std::string LOON_FFI_PROPERTIES_KEY = "loon_ffi_properties";
 const std::string STATS_BASE_PATH_KEY = "stats_base_path";
+const std::string JSON_STATS_CACHE_SHARD_KEY = "json_stats_cache_shard";
 
 // storage version
 const int64_t STORAGE_V1 = 1;

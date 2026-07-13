@@ -26,12 +26,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v4/disk"
 	"go.uber.org/atomic"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/v3/config"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/fips"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
@@ -42,7 +41,7 @@ import (
 const (
 	// DefaultIndexSliceSize defines the default slice size of index file when serializing.
 	DefaultIndexSliceSize                      = 16
-	DefaultStreamBudgetRatio                   = 3.0
+	DefaultLoadTransientBudgetBytes            = 0
 	DefaultGracefulTime                        = 5000 // ms
 	DefaultGracefulStopTimeout                 = 1800 // s, for node
 	DefaultProxyGracefulStopTimeout            = 30   // s，for proxy
@@ -50,7 +49,6 @@ const (
 	DefaultHighPriorityThreadCoreCoefficient   = 10
 	DefaultMiddlePriorityThreadCoreCoefficient = 5
 	DefaultLowPriorityThreadCoreCoefficient    = 1
-	DefaultBM25LoadThreadCoreCoefficient       = 1
 	DefaultThreadPoolMaxThreadsSize            = 16
 
 	DefaultSessionTTL        = 15 // s
@@ -131,7 +129,7 @@ func (p *ComponentParam) init(bt *BaseTable) {
 
 	p.CommonCfg.init(bt)
 	if fips.MaybeEnableOpenSSLFIPS() && !p.MinioCfg.UseCRC32C.GetAsBool() {
-		log.Warn("FIPS mode requires CRC32C checksum for S3 PutObject requests; override minio.ssl.useCRC32C to true at runtime")
+		mlog.Warn(context.TODO(), "FIPS mode requires CRC32C checksum for S3 PutObject requests; override minio.ssl.useCRC32C to true at runtime")
 		p.MinioCfg.UseCRC32C.SwapTempValue("true")
 	}
 	p.QuotaConfig.init(bt)
@@ -233,11 +231,10 @@ type commonConfig struct {
 	DefaultIndexName     ParamItem `refreshable:"true"`
 
 	IndexSliceSize                      ParamItem `refreshable:"false"`
-	StreamBudgetRatio                   ParamItem `refreshable:"true"`
+	LoadTransientBudgetBytes            ParamItem `refreshable:"true"`
 	HighPriorityThreadCoreCoefficient   ParamItem `refreshable:"true"`
 	MiddlePriorityThreadCoreCoefficient ParamItem `refreshable:"true"`
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"true"`
-	BM25LoadThreadCoreCoefficient       ParamItem `refreshable:"true"`
 	ThreadPoolMaxThreadsSize            ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolCoefficient        ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolMaxCapacity        ParamItem `refreshable:"true"`
@@ -277,6 +274,7 @@ type commonConfig struct {
 	RootShouldBindRole    ParamItem `refreshable:"true"`
 	EnablePublicPrivilege ParamItem `refreshable:"false"`
 	ExprEnabled           ParamItem `refreshable:"false"`
+	ExprAuthMode          ParamItem `refreshable:"false"`
 
 	ClusterName ParamItem `refreshable:"false"`
 
@@ -346,6 +344,7 @@ type commonConfig struct {
 	SyncTaskPoolReleaseTimeoutSeconds ParamItem `refreshable:"true"`
 
 	EnabledOptimizeExpr               ParamItem `refreshable:"true"`
+	EnableDriverPrefetch              ParamItem `refreshable:"true"`
 	EnabledJSONKeyStats               ParamItem `refreshable:"true"`
 	EnabledGrowingSegmentJSONKeyStats ParamItem `refreshable:"true"`
 
@@ -558,14 +557,27 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 	}
 	p.IndexSliceSize.Init(base.mgr)
 
-	p.StreamBudgetRatio = ParamItem{
-		Key:          "common.entryStream.streamBudgetRatio",
+	p.LoadTransientBudgetBytes = ParamItem{
+		Key:          "common.loadTransientBudgetBytes",
 		Version:      "3.0.0",
-		DefaultValue: fmt.Sprintf("%f", DefaultStreamBudgetRatio),
-		Doc:          "Multiplier for entry stream transient memory budget, relative to CPU core count",
-		Export:       true,
+		DefaultValue: strconv.Itoa(DefaultLoadTransientBudgetBytes),
+		Doc: `Process-wide transient memory budget in bytes shared by scalar ` +
+			`index V3 entry streaming and storage v2/v3 field-data loading. It gates ` +
+			`in-flight transient data across concurrent load tasks. Lower ` +
+			`values reduce peak transient memory at the cost of load throughput. ` +
+			`Oversized requests are still allowed to proceed exclusively to ` +
+			`guarantee progress. Set to 0 to disable the limit.`,
+		Export: true,
+		Formatter: func(v string) string {
+			if getAsInt64(v) < 0 {
+				mlog.Warn(context.TODO(), "common.loadTransientBudgetBytes must be non-negative, using unlimited",
+					mlog.String("configured", v))
+				return strconv.Itoa(DefaultLoadTransientBudgetBytes)
+			}
+			return v
+		},
 	}
-	p.StreamBudgetRatio.Init(base.mgr)
+	p.LoadTransientBudgetBytes.Init(base.mgr)
 
 	p.EnableMaterializedView = ParamItem{
 		Key:          "common.materializedView.enabled",
@@ -662,7 +674,7 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Key:          "common.storageType",
 		Version:      "2.0.0",
 		DefaultValue: "remote",
-		Doc:          "please adjust in embedded Milvus: local, available values are [local, remote, opendal], value minio is deprecated, use remote instead",
+		Doc:          "please adjust in embedded Milvus: local, available values are [local, remote], value minio is deprecated, use remote instead",
 		Export:       true,
 	}
 	p.StorageType.Init(base.mgr)
@@ -705,16 +717,6 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export: true,
 	}
 	p.LowPriorityThreadCoreCoefficient.Init(base.mgr)
-
-	p.BM25LoadThreadCoreCoefficient = ParamItem{
-		Key:          "common.threadCoreCoefficient.bm25Load",
-		Version:      "2.6.8",
-		DefaultValue: strconv.Itoa(DefaultBM25LoadThreadCoreCoefficient),
-		Doc: "This parameter specify how many times the number of threads " +
-			"is the number of cores in BM25 load pool",
-		Export: true,
-	}
-	p.BM25LoadThreadCoreCoefficient.Init(base.mgr)
 
 	p.ThreadPoolMaxThreadsSize = ParamItem{
 		Key:          "common.threadCoreCoefficient.maxThreadsSize",
@@ -934,10 +936,21 @@ Large numeric passwords require double quotes to avoid yaml parsing precision is
 		Key:          "common.security.exprEnabled",
 		Version:      "2.6.0",
 		DefaultValue: "false",
-		Doc:          "Whether to enable the /expr endpoint for debugging. When enabled, only root user can access it via HTTP Basic Auth on Proxy nodes.",
+		Doc:          "Whether to enable the /expr endpoint for debugging.",
 		Export:       true,
 	}
 	p.ExprEnabled.Init(base.mgr)
+
+	p.ExprAuthMode = ParamItem{
+		Key:          "common.security.exprAuthMode",
+		Version:      "2.6.0",
+		DefaultValue: "rootOnly",
+		Doc: "Authentication mode for the /expr endpoint. Valid values: rootOnly, rbac. " +
+			"rootOnly accepts only the root credentials via HTTP Basic Auth. " +
+			"rbac requires common.security.authorizationEnabled=true and grants access to any user holding the Expr privilege.",
+		Export: true,
+	}
+	p.ExprAuthMode.Init(base.mgr)
 
 	p.ClusterName = ParamItem{
 		Key:          "common.cluster.name",
@@ -1379,6 +1392,15 @@ If enabled, IPv6 ULA/global addresses will be prioritized ahead of IPv4.`,
 		Export:       true,
 	}
 	p.EnabledOptimizeExpr.Init(base.mgr)
+
+	p.EnableDriverPrefetch = ParamItem{
+		Key:          "common.enableDriverPrefetch",
+		Version:      "3.0",
+		DefaultValue: "false",
+		Doc:          "Indicates whether to enable query driver prefetch in segcore.",
+		Export:       true,
+	}
+	p.EnableDriverPrefetch.Init(base.mgr)
 
 	p.UsingJSONStatsForQuery = ParamItem{
 		Key:          "common.usingJSONShreddingForQuery",
@@ -2053,6 +2075,7 @@ type proxyConfig struct {
 	MaxNameLength                     ParamItem `refreshable:"true"`
 	MaxCollectionDescriptionLength    ParamItem `refreshable:"true"`
 	MaxUsernameLength                 ParamItem `refreshable:"true"`
+	MaxUserDescriptionLength          ParamItem `refreshable:"true"`
 	MinPasswordLength                 ParamItem `refreshable:"true"`
 	MaxPasswordLength                 ParamItem `refreshable:"true"`
 	MaxFieldNum                       ParamItem `refreshable:"true"`
@@ -2063,6 +2086,7 @@ type proxyConfig struct {
 	GinLogSkipPaths                   ParamItem `refreshable:"false"`
 	MaxUserNum                        ParamItem `refreshable:"true"`
 	MaxRoleNum                        ParamItem `refreshable:"true"`
+	MaxRoleDescriptionLength          ParamItem `refreshable:"true"`
 	NameValidationAllowedChars        ParamItem `refreshable:"true"`
 	RoleNameValidationAllowedChars    ParamItem `refreshable:"true"`
 	MaxTaskNum                        ParamItem `refreshable:"false"`
@@ -2085,6 +2109,7 @@ type proxyConfig struct {
 	ResolveAliasForPrivilege          ParamItem `refreshable:"true"`
 	MaxVarCharLength                  ParamItem `refreshable:"false"`
 	MaxTextLength                     ParamItem `refreshable:"false"`
+	MaxArrayCapacity                  ParamItem `refreshable:"true"`
 	MaxIndexParamsSize                ParamItem `refreshable:"true"`
 	MaxResultEntries                  ParamItem `refreshable:"true"`
 	EnableCachedServiceProvider       ParamItem `refreshable:"true"`
@@ -2174,6 +2199,14 @@ func (p *proxyConfig) init(base *BaseTable) {
 		PanicIfEmpty: true,
 	}
 	p.MaxUsernameLength.Init(base.mgr)
+
+	p.MaxUserDescriptionLength = ParamItem{
+		Key:          "proxy.maxUserDescriptionLength",
+		DefaultValue: "1024",
+		Version:      "2.6.19",
+		PanicIfEmpty: true,
+	}
+	p.MaxUserDescriptionLength.Init(base.mgr)
 
 	p.MaxPasswordLength = ParamItem{
 		Key:          "proxy.maxPasswordLength",
@@ -2295,6 +2328,16 @@ please adjust in embedded Milvus: false`,
 		PanicIfEmpty: true,
 	}
 	p.MaxRoleNum.Init(base.mgr)
+
+	p.MaxRoleDescriptionLength = ParamItem{
+		Key:          "proxy.maxRoleDescriptionLength",
+		DefaultValue: "1024",
+		Version:      "3.0.0",
+		PanicIfEmpty: true,
+		Doc:          "Maximum role description length in bytes.",
+		Export:       true,
+	}
+	p.MaxRoleDescriptionLength.Init(base.mgr)
 
 	p.NameValidationAllowedChars = ParamItem{
 		Key:          "proxy.nameValidation.allowedChars",
@@ -2564,6 +2607,22 @@ please adjust in embedded Milvus: false`,
 	}
 	p.MaxTextLength.Init(base.mgr)
 
+	p.MaxArrayCapacity = ParamItem{
+		Key:          "proxy.maxArrayCapacity",
+		Version:      "2.6.19",
+		DefaultValue: "4096",
+		PanicIfEmpty: true,
+		Doc:          "maximum number of elements in an array field for a single row",
+		Export:       true,
+		Formatter: func(v string) string {
+			if getAsInt64(v) <= 0 {
+				return "4096"
+			}
+			return v
+		},
+	}
+	p.MaxArrayCapacity.Init(base.mgr)
+
 	p.MaxIndexParamsSize = ParamItem{
 		Key:          "proxy.maxIndexParamsSize",
 		Version:      "3.0.0",
@@ -2714,6 +2773,7 @@ type queryCoordConfig struct {
 	ChannelTaskTimeout         ParamItem `refreshable:"true"`
 	SegmentTaskTimeout         ParamItem `refreshable:"true"`
 	DistPullInterval           ParamItem `refreshable:"false"`
+	DispatchInterval           ParamItem `refreshable:"false"`
 	HeartbeatAvailableInterval ParamItem `refreshable:"true"`
 	LoadTimeoutSeconds         ParamItem `refreshable:"true"`
 
@@ -2745,13 +2805,14 @@ type queryCoordConfig struct {
 	StoppingBalanceAssignPolicy    ParamItem `refreshable:"true"`
 	ChannelExclusiveNodeFactor     ParamItem `refreshable:"true"`
 
-	CollectionObserverInterval         ParamItem `refreshable:"false"`
-	CollectionBalanceSegmentBatchSize  ParamItem `refreshable:"true"`
-	CollectionBalanceChannelBatchSize  ParamItem `refreshable:"true"`
-	UpdateCollectionLoadStatusInterval ParamItem `refreshable:"false"`
-	ClusterLevelLoadReplicaNumber      ParamItem `refreshable:"true"`
-	ClusterLevelLoadResourceGroups     ParamItem `refreshable:"true"`
-	ClusterLevelLoadWaitRGReadyTimeout ParamItem `refreshable:"true"`
+	CollectionObserverInterval                   ParamItem `refreshable:"false"`
+	CollectionBalanceSegmentBatchSize            ParamItem `refreshable:"true"`
+	CollectionBalanceChannelBatchSize            ParamItem `refreshable:"true"`
+	UpdateCollectionLoadStatusInterval           ParamItem `refreshable:"false"`
+	ClusterLevelLoadReplicaNumber                ParamItem `refreshable:"true"`
+	ClusterLevelLoadResourceGroups               ParamItem `refreshable:"true"`
+	ClusterLevelLoadForceOverrideUserReplicaMode ParamItem `refreshable:"true"`
+	ClusterLevelLoadWaitRGReadyTimeout           ParamItem `refreshable:"true"`
 
 	// balance batch size in one trigger
 	BalanceSegmentBatchSize            ParamItem `refreshable:"true"`
@@ -2839,7 +2900,7 @@ If this parameter is set false, Milvus simply searches the growing segments with
 	p.Balancer = ParamItem{
 		Key:          "queryCoord.balancer",
 		Version:      "2.0.0",
-		DefaultValue: "ScoreBasedBalancer",
+		DefaultValue: "ChannelLevelScoreBalancer",
 		PanicIfEmpty: false,
 		Doc:          "auto balancer used for segments on queryNodes",
 		Export:       true,
@@ -3091,6 +3152,15 @@ If this parameter is set false, Milvus simply searches the growing segments with
 	}
 	p.DistPullInterval.Init(base.mgr)
 
+	p.DispatchInterval = ParamItem{
+		Key:          "queryCoord.dispatchInterval",
+		Version:      "2.6.0",
+		DefaultValue: "500",
+		PanicIfEmpty: true,
+		Export:       true,
+	}
+	p.DispatchInterval.Init(base.mgr)
+
 	p.LoadTimeoutSeconds = ParamItem{
 		Key:          "queryCoord.loadTimeoutSeconds",
 		Version:      "2.0.0",
@@ -3305,8 +3375,8 @@ If this parameter is set false, Milvus simply searches the growing segments with
 	p.ChannelExclusiveNodeFactor = ParamItem{
 		Key:          "queryCoord.channelExclusiveNodeFactor",
 		Version:      "2.4.2",
-		DefaultValue: "4",
-		Doc:          "the least node number for enable channel's exclusive mode",
+		DefaultValue: "3",
+		Doc:          "minimum RW QueryNode count per channel required to enable channel exclusive mode",
 		Export:       true,
 	}
 	p.ChannelExclusiveNodeFactor.Init(base.mgr)
@@ -3355,6 +3425,15 @@ If this parameter is set false, Milvus simply searches the growing segments with
 		Export:       false,
 	}
 	p.ClusterLevelLoadResourceGroups.Init(base.mgr)
+
+	p.ClusterLevelLoadForceOverrideUserReplicaMode = ParamItem{
+		Key:          "queryCoord.clusterLevelLoadForceOverrideUserReplicaMode",
+		Version:      "2.6.14",
+		DefaultValue: "false",
+		Doc:          "when true and cluster-level load replica/RG config is complete, new load requests use the cluster-level load config even if users specify replica number or resource groups. Existing user-specified collections are taken over when they need a load-config update; collections already matching the cluster-level config may not be rewritten immediately, so their user-specified marker can remain until a later update. This is a one-way takeover: once a collection is updated, it is converted to cluster-level managed mode and turning this back off will not restore the previous user-specified replica mode.",
+		Export:       false,
+	}
+	p.ClusterLevelLoadForceOverrideUserReplicaMode.Init(base.mgr)
 
 	p.ClusterLevelLoadWaitRGReadyTimeout = ParamItem{
 		Key:          "queryCoord.clusterLevelLoadWaitRGReadyTimeout",
@@ -3516,6 +3595,7 @@ type queryNodeConfig struct {
 	TieredLoadingTimeoutMs          ParamItem `refreshable:"true"`
 	TieredWarmupLoadingTimeoutMs    ParamItem `refreshable:"true"`
 	StorageUsageTrackingEnabled     ParamItem `refreshable:"true"`
+	TieredRejectRemoteVectorOutput  ParamItem `refreshable:"true"`
 
 	KnowhereScoreConsistency ParamItem `refreshable:"false"`
 
@@ -3596,6 +3676,19 @@ type queryNodeConfig struct {
 	// CGOPoolSize ratio to MaxReadConcurrency
 	CGOPoolSizeRatio ParamItem `refreshable:"true"`
 
+	// MutatePoolSizeFactor controls the size of the online-write CGO pool
+	// (segment Insert/Delete) as CPUNum * factor. The mutate pool is isolated
+	// from load/management work so segment loading cannot starve online writes.
+	MutatePoolSizeFactor ParamItem `refreshable:"true"`
+
+	// DynamicPoolSizeFactor controls the size of the dynamic CGO pool
+	// (segment create/release/statistics/index-info) as CPUNum * factor.
+	DynamicPoolSizeFactor ParamItem `refreshable:"true"`
+
+	// DeletePoolSizeFactor controls the size of the DeleteBatch dispatch pool
+	// as CPUNum * factor.
+	DeletePoolSizeFactor ParamItem `refreshable:"true"`
+
 	// Target average byte size per storage v2 cache cell. Parquet row groups
 	// are packed into cells so rgs_per_cell * avg_rg_size ≈ this value.
 	StorageV2CellTargetSizeBytes ParamItem `refreshable:"true"`
@@ -3611,13 +3704,20 @@ type queryNodeConfig struct {
 	EnableLatestDeleteSnapshotOptimization ParamItem `refreshable:"true"`
 
 	// expr cache
-	ExprResCacheEnabled       ParamItem `refreshable:"false"`
-	ExprResCacheCapacityBytes ParamItem `refreshable:"false"`
+	ExprResCacheEnabled               ParamItem `refreshable:"true"`
+	ExprResCacheMode                  ParamItem `refreshable:"true"`
+	ExprResCacheMinEvalDurationUs     ParamItem `refreshable:"true"`
+	ExprResCacheAdmissionThreshold    ParamItem `refreshable:"true"`
+	ExprResCacheMemMaxBytes           ParamItem `refreshable:"true"`
+	ExprResCacheMemCompressionEnabled ParamItem `refreshable:"true"`
+	ExprResCacheDiskMaxBytes          ParamItem `refreshable:"true"`
+	ExprResCacheDiskMaxFileSizeBytes  ParamItem `refreshable:"true"`
 
 	// pipeline
 	CleanExcludeSegInterval ParamItem `refreshable:"false"`
 	FlowGraphMaxQueueLength ParamItem `refreshable:"false"`
 	FlowGraphMaxParallelism ParamItem `refreshable:"false"`
+	DMLMicroBatchMaxMsgNum  ParamItem `refreshable:"true"`
 
 	MemoryIndexLoadPredictMemoryUsageFactor ParamItem `refreshable:"true"`
 	EnableSegmentPrune                      ParamItem `refreshable:"true"`
@@ -3718,6 +3818,15 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.FlowGraphMaxParallelism.Init(base.mgr)
+
+	p.DMLMicroBatchMaxMsgNum = ParamItem{
+		Key:          "queryNode.dataSync.dmlMicroBatch.maxMsgNum",
+		Version:      "3.0.0",
+		DefaultValue: "8",
+		Doc:          "Maximum number of DML messages in one micro-batch drained by query node data sync pipeline. The batcher only drains already buffered messages and does not wait for more messages.",
+		Export:       true,
+	}
+	p.DMLMicroBatchMaxMsgNum.Init(base.mgr)
 
 	p.StatsPublishInterval = ParamItem{
 		Key:          "queryNode.stats.publishInterval",
@@ -3967,6 +4076,15 @@ If set to 0, time based eviction is disabled.`,
 		Export:       true,
 	}
 	p.StorageUsageTrackingEnabled.Init(base.mgr)
+
+	p.TieredRejectRemoteVectorOutput = ParamItem{
+		Key:          "queryNode.segcore.tieredStorage.rejectRemoteVectorOutput",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "When true, search/query fails instead of loading remote vector field data for output fields that are not already cached in local memory or disk.",
+		Export:       false,
+	}
+	p.TieredRejectRemoteVectorOutput.Init(base.mgr)
 
 	p.TieredLoadingResourceFactor = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.loadingResourceFactor",
@@ -4446,7 +4564,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.MaxGroupNQ = ParamItem{
 		Key:          "queryNode.grouping.maxNQ",
 		Version:      "2.0.0",
-		DefaultValue: "16",
+		DefaultValue: "64",
 		Export:       true,
 	}
 	p.MaxGroupNQ.Init(base.mgr)
@@ -4454,7 +4572,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.NQMergeRatio = ParamItem{
 		Key:          "queryNode.grouping.nqMergeRatio",
 		Version:      "2.6.17",
-		DefaultValue: "3.0",
+		DefaultValue: "16.0",
 		Doc:          "Maximum ratio between merged total NQ and the smaller task NQ when grouping query node read tasks.",
 		Export:       true,
 	}
@@ -4526,12 +4644,12 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 				localStoragePath := getLocalStoragePath(base)
 				if _, err := os.Stat(localStoragePath); os.IsNotExist(err) {
 					if err := os.MkdirAll(localStoragePath, os.ModePerm); err != nil {
-						log.Fatal("failed to mkdir", zap.String("localStoragePath", localStoragePath), zap.Error(err))
+						mlog.Fatal(context.TODO(), "failed to mkdir", mlog.String("localStoragePath", localStoragePath), mlog.Err(err))
 					}
 				}
 				diskUsage, err := disk.Usage(localStoragePath)
 				if err != nil {
-					log.Fatal("failed to get disk usage", zap.String("localStoragePath", localStoragePath), zap.Error(err))
+					mlog.Fatal(context.TODO(), "failed to get disk usage", mlog.String("localStoragePath", localStoragePath), mlog.Err(err))
 				}
 				return strconv.FormatUint(diskUsage.Total, 10)
 			}
@@ -4753,6 +4871,33 @@ user-task-polling:
 	}
 	p.CGOPoolSizeRatio.Init(base.mgr)
 
+	p.MutatePoolSizeFactor = ParamItem{
+		Key:          "queryNode.segcore.mutatePoolSizeFactor",
+		Version:      "3.0.0",
+		DefaultValue: "2",
+		Doc:          "size factor (CPUNum * factor) of the online-write cgo pool for segment insert/delete; isolated from the load/management pool so segment loading cannot starve online writes",
+		Export:       true,
+	}
+	p.MutatePoolSizeFactor.Init(base.mgr)
+
+	p.DynamicPoolSizeFactor = ParamItem{
+		Key:          "queryNode.segcore.dynamicPoolSizeFactor",
+		Version:      "3.0.0",
+		DefaultValue: "1",
+		Doc:          "size factor (CPUNum * factor) of the dynamic cgo pool for segment create/release/statistics/index-info",
+		Export:       true,
+	}
+	p.DynamicPoolSizeFactor.Init(base.mgr)
+
+	p.DeletePoolSizeFactor = ParamItem{
+		Key:          "queryNode.segcore.deletePoolSizeFactor",
+		Version:      "3.0.0",
+		DefaultValue: "1",
+		Doc:          "size factor (CPUNum * factor) of the DeleteBatch dispatch pool",
+		Export:       true,
+	}
+	p.DeletePoolSizeFactor.Init(base.mgr)
+
 	p.StorageV2CellTargetSizeBytes = ParamItem{
 		Key:          "queryNode.segcore.storageV2.cellTargetSizeBytes",
 		Version:      "3.0.0",
@@ -4765,8 +4910,8 @@ user-task-polling:
 		Export: true,
 		Formatter: func(v string) string {
 			if getAsInt64(v) <= 0 {
-				log.Warn("queryNode.segcore.storageV2.cellTargetSizeBytes must be positive, using default 4 MiB",
-					zap.String("configured", v))
+				mlog.Warn(context.TODO(), "queryNode.segcore.storageV2.cellTargetSizeBytes must be positive, using default 4 MiB",
+					mlog.String("configured", v))
 				return "4194304"
 			}
 			return v
@@ -4812,22 +4957,79 @@ user-task-polling:
 	p.ExprResCacheEnabled = ParamItem{
 		Key:          "queryNode.exprCache.enabled",
 		FallbackKeys: []string{"enable_expr_cache"},
-		Version:      "2.6.0",
+		Version:      "3.0.0",
 		DefaultValue: "false",
 		Doc:          "enable expression result cache",
 		Export:       true,
 	}
 	p.ExprResCacheEnabled.Init(base.mgr)
 
-	p.ExprResCacheCapacityBytes = ParamItem{
-		Key:          "queryNode.exprCache.capacityBytes",
-		FallbackKeys: []string{"max_expr_cache_size"},
-		Version:      "2.6.0",
-		DefaultValue: "268435456", // 256MB
-		Doc:          "max capacity in bytes for expression result cache",
+	p.ExprResCacheMode = ParamItem{
+		Key:          "queryNode.exprCache.mode",
+		Version:      "3.0.0",
+		DefaultValue: "disk",
+		Doc:          "cache mode: 'disk' (sealed segments only, pread/pwrite + fixed slots) or 'memory' (sealed and growing segments, malloc + Clock + compression)",
 		Export:       true,
 	}
-	p.ExprResCacheCapacityBytes.Init(base.mgr)
+	p.ExprResCacheMode.Init(base.mgr)
+
+	p.ExprResCacheMinEvalDurationUs = ParamItem{
+		Key:          "queryNode.exprCache.minEvalDurationUs",
+		FallbackKeys: []string{"queryNode.exprCache.memory.minEvalDurationUs", "queryNode.exprCache.disk.minEvalDurationUs"},
+		Version:      "3.0.0",
+		DefaultValue: "1000",
+		Doc:          "global latency filter: skip expressions that eval faster than this (0=disabled)",
+		Export:       true,
+	}
+	p.ExprResCacheMinEvalDurationUs.Init(base.mgr)
+
+	p.ExprResCacheMemMaxBytes = ParamItem{
+		Key:          "queryNode.exprCache.memory.maxBytes",
+		FallbackKeys: []string{"queryNode.exprCache.maxTotalSizeBytes"},
+		Version:      "3.0.0",
+		DefaultValue: "268435456",
+		Doc:          "max memory for expression cache in memory mode (default 256MB)",
+		Export:       true,
+	}
+	p.ExprResCacheMemMaxBytes.Init(base.mgr)
+
+	p.ExprResCacheMemCompressionEnabled = ParamItem{
+		Key:          "queryNode.exprCache.memory.compressionEnabled",
+		FallbackKeys: []string{"queryNode.exprCache.compressionEnabled"},
+		Version:      "3.0.0",
+		DefaultValue: "true",
+		Doc:          "enable Roaring/Raw adaptive compression in memory mode",
+		Export:       true,
+	}
+	p.ExprResCacheMemCompressionEnabled.Init(base.mgr)
+
+	p.ExprResCacheAdmissionThreshold = ParamItem{
+		Key:          "queryNode.exprCache.admissionThreshold",
+		Version:      "3.0.0",
+		DefaultValue: "2",
+		Doc:          "frequency admission for memory and disk mode: cache after N+ occurrences (1=no gating)",
+		Export:       true,
+	}
+	p.ExprResCacheAdmissionThreshold.Init(base.mgr)
+
+	p.ExprResCacheDiskMaxBytes = ParamItem{
+		Key:          "queryNode.exprCache.disk.maxBytes",
+		Version:      "3.0.0",
+		DefaultValue: "10737418240",
+		Doc:          "max total disk usage for expression cache in disk mode (default 10GB)",
+		Export:       true,
+	}
+	p.ExprResCacheDiskMaxBytes.Init(base.mgr)
+
+	p.ExprResCacheDiskMaxFileSizeBytes = ParamItem{
+		Key:          "queryNode.exprCache.disk.maxFileSizeBytes",
+		FallbackKeys: []string{"queryNode.exprCache.maxSegmentFileSizeBytes"},
+		Version:      "3.0.0",
+		DefaultValue: "268435456",
+		Doc:          "max file size per sealed segment in disk mode (default 256MB)",
+		Export:       true,
+	}
+	p.ExprResCacheDiskMaxFileSizeBytes.Init(base.mgr)
 
 	p.CleanExcludeSegInterval = ParamItem{
 		Key:          "queryCoord.cleanExcludeSegmentInterval",
@@ -5106,12 +5308,14 @@ type dataCoordConfig struct {
 	GCLOBSafetyWindow  ParamItem `refreshable:"true"`
 	GCLOBCheckInterval ParamItem `refreshable:"true"`
 
-	BindIndexNodeMode    ParamItem `refreshable:"false"`
-	IndexNodeAddress     ParamItem `refreshable:"false"`
-	WithCredential       ParamItem `refreshable:"false"`
-	IndexNodeID          ParamItem `refreshable:"false"`
-	TaskScheduleInterval ParamItem `refreshable:"false"`
-	TaskSlowThreshold    ParamItem `refreshable:"true"`
+	BindIndexNodeMode           ParamItem `refreshable:"false"`
+	IndexNodeAddress            ParamItem `refreshable:"false"`
+	WithCredential              ParamItem `refreshable:"false"`
+	IndexNodeID                 ParamItem `refreshable:"false"`
+	TaskScheduleInterval        ParamItem `refreshable:"false"`
+	TaskRetryBackoffInterval    ParamItem `refreshable:"true"`
+	TaskRetryBackoffMaxInterval ParamItem `refreshable:"true"`
+	TaskSlowThreshold           ParamItem `refreshable:"true"`
 
 	MinSegmentNumRowsToEnableIndex ParamItem `refreshable:"true"`
 	BrokerTimeout                  ParamItem `refreshable:"false"`
@@ -6141,6 +6345,25 @@ During compaction, the size of segment # of rows is able to exceed segment max #
 	}
 	p.TaskScheduleInterval.Init(base.mgr)
 
+	p.TaskRetryBackoffInterval = ParamItem{
+		Key:          "dataCoord.taskRetryBackoffInterval",
+		Version:      "2.6.18",
+		DefaultValue: "1",
+		Doc: "Initial backoff in seconds before re-dispatching a task (compaction/stats/index/import) that failed on a worker; " +
+			"doubles on each consecutive failure up to dataCoord.taskRetryBackoffMaxInterval. 0 disables the backoff (legacy behavior: failed tasks are re-dispatched every scheduling tick).",
+		Export: true,
+	}
+	p.TaskRetryBackoffInterval.Init(base.mgr)
+
+	p.TaskRetryBackoffMaxInterval = ParamItem{
+		Key:          "dataCoord.taskRetryBackoffMaxInterval",
+		Version:      "2.6.18",
+		DefaultValue: "60",
+		Doc:          "Maximum backoff in seconds between re-dispatches of a task that keeps failing on workers.",
+		Export:       true,
+	}
+	p.TaskRetryBackoffMaxInterval.Init(base.mgr)
+
 	p.TaskSlowThreshold = ParamItem{
 		Key:          "datacoord.scheduler.taskSlowThreshold",
 		Version:      "2.0.0",
@@ -6448,10 +6671,12 @@ if param targetScalarIndexVersion is not set, the default value is -1, which mea
 	p.ExternalCollectionDropRatioWarn.Init(base.mgr)
 
 	p.ExternalCollectionPreAllocSegments = ParamItem{
-		Key:          "dataCoord.externalCollectionPreAllocSegments",
-		Version:      "2.6.8",
-		Doc:          "The number of IDs to pre-allocate for each external collection refresh task. Each segment consumes 2 IDs (1 for segment, 1 for fake binlog logID).",
-		DefaultValue: "10000",
+		Key:     "dataCoord.externalCollectionPreAllocSegments",
+		Version: "2.6.8",
+		Doc: "The number of IDs to pre-allocate for each external collection refresh task. " +
+			"Each segment consumes 2 IDs (1 for segment, 1 for fake binlog logID); " +
+			"milvus-table deltalogs without LogID consume additional fallback IDs.",
+		DefaultValue: "500000",
 		PanicIfEmpty: false,
 	}
 	p.ExternalCollectionPreAllocSegments.Init(base.mgr)
@@ -6846,7 +7071,7 @@ func (p *dataNodeConfig) init(base *BaseTable) {
 		Formatter: func(v string) string {
 			concurrency := getAsInt(v)
 			if concurrency < 1 {
-				log.Warn("positive parallel task number, reset to default 16", zap.String("value", v))
+				mlog.Warn(context.TODO(), "positive parallel task number, reset to default 16", mlog.String("value", v))
 				return "16" // MaxParallelSyncMgrTasksPerCPUCore must >= 1
 			}
 			return strconv.FormatInt(int64(concurrency), 10)
@@ -6904,7 +7129,7 @@ Setting this parameter too small causes the system to store a small amount of da
 			Export:       true,
 		}
 	} else {
-		log.Info("DeployModeEnv is not set, use default", zap.Float64("default", 0.5))
+		mlog.Info(context.TODO(), "DeployModeEnv is not set, use default", mlog.Float64("default", 0.5))
 		p.MemoryForceSyncWatermark = ParamItem{
 			Key:          "dataNode.memory.forceSyncWatermark",
 			Version:      "2.4.0",
@@ -6950,7 +7175,9 @@ Setting this parameter too small causes the system to store a small amount of da
 	p.IOConcurrency = ParamItem{
 		Key:          "dataNode.dataSync.ioConcurrency",
 		Version:      "2.0.0",
-		DefaultValue: "16",
+		DefaultValue: "0",
+		Doc:          "Concurrency of the datanode object-storage I/O pool (download/upload for compaction and stats tasks). 0 or negative means auto (CPU*2).",
+		Export:       true,
 	}
 	p.IOConcurrency.Init(base.mgr)
 
@@ -7096,7 +7323,7 @@ if this parameter <= 0, will set it as 10`,
 		Formatter: func(v string) string {
 			percentage := getAsFloat(v)
 			if percentage <= 0 || percentage > 100 {
-				log.Warn("invalid import memory limit percentage, using default 10%")
+				mlog.Warn(context.TODO(), "invalid import memory limit percentage, using default 10%")
 				return "10"
 			}
 			return fmt.Sprintf("%f", percentage)
@@ -8169,7 +8396,7 @@ func getLocalStoragePath(base *BaseTable) string {
 	localStoragePath := base.Get("localStorage.path")
 	if len(localStoragePath) == 0 {
 		localStoragePath = defaultLocalStoragePath
-		log.Warn("localStorage.path is not set, using default value", zap.String("localStorage.path", localStoragePath))
+		mlog.Warn(context.TODO(), "localStorage.path is not set, using default value", mlog.String("localStorage.path", localStoragePath))
 	}
 	return localStoragePath
 }

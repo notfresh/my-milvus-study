@@ -29,7 +29,6 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/atomic"
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -40,7 +39,7 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/util/lifetime"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
@@ -528,6 +527,10 @@ func Test_compactionTrigger_force(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
+	preAllocateIDExpansionFactor := paramtable.Get().DataCoordCfg.CompactionPreAllocateIDExpansionFactor.GetAsInt64()
+	preAllocatedSegmentIDBegin := int64(100)
+	preAllocatedSegmentIDEnd := preAllocatedSegmentIDBegin + preAllocateIDExpansionFactor
+	preAllocatedLogIDEnd := preAllocatedSegmentIDBegin + 4*preAllocateIDExpansionFactor
 
 	tests := []struct {
 		name         string
@@ -576,7 +579,7 @@ func Test_compactionTrigger_force(t *testing.T) {
 			},
 			[]*datapb.CompactionPlan{
 				{
-					PlanID: 100,
+					PlanID: preAllocatedSegmentIDEnd,
 					SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
 						{
 							SegmentID: 1,
@@ -629,8 +632,8 @@ func Test_compactionTrigger_force(t *testing.T) {
 					Channel:                "ch1",
 					TotalRows:              200,
 					Schema:                 schema,
-					PreAllocatedSegmentIDs: &datapb.IDRange{Begin: 101, End: 200},
-					PreAllocatedLogIDs:     &datapb.IDRange{Begin: 100, End: 200},
+					PreAllocatedSegmentIDs: &datapb.IDRange{Begin: preAllocatedSegmentIDBegin, End: preAllocatedSegmentIDEnd},
+					PreAllocatedLogIDs:     &datapb.IDRange{Begin: preAllocatedSegmentIDBegin, End: preAllocatedLogIDEnd},
 					MaxSize:                1073741824,
 					SlotUsage:              paramtable.Get().DataCoordCfg.MixCompactionSlotUsage.GetAsInt64(),
 					JsonParams:             params,
@@ -1319,7 +1322,7 @@ func Test_compactionTrigger_PrioritizedCandi(t *testing.T) {
 		(tt.fields.inspector).(*spyCompactionInspector).meta = tt.fields.meta
 		t.Run(tt.name, func(t *testing.T) {
 			tt.fields.meta.channelCPs.checkpoints["ch1"] = &msgpb.MsgPosition{
-				Timestamp: tsoutil.ComposeTSByTime(time.Now(), 0),
+				Timestamp: tsoutil.ComposeTSByTime(time.Now()),
 				MsgID:     []byte{1, 2, 3, 4},
 			}
 			tr := &compactionTrigger{
@@ -1462,7 +1465,7 @@ func Test_compactionTrigger_SmallCandi(t *testing.T) {
 		(tt.fields.inspector).(*spyCompactionInspector).meta = tt.fields.meta
 		t.Run(tt.name, func(t *testing.T) {
 			tt.fields.meta.channelCPs.checkpoints["ch1"] = &msgpb.MsgPosition{
-				Timestamp: tsoutil.ComposeTSByTime(time.Now(), 0),
+				Timestamp: tsoutil.ComposeTSByTime(time.Now()),
 				MsgID:     []byte{1, 2, 3, 4},
 			}
 			tr := &compactionTrigger{
@@ -1646,7 +1649,7 @@ func Test_compactionTrigger_noplan_random_size(t *testing.T) {
 		(tt.fields.inspector).(*spyCompactionInspector).meta = tt.fields.meta
 		t.Run(tt.name, func(t *testing.T) {
 			tt.fields.meta.channelCPs.checkpoints["ch1"] = &msgpb.MsgPosition{
-				Timestamp: tsoutil.ComposeTSByTime(time.Now(), 0),
+				Timestamp: tsoutil.ComposeTSByTime(time.Now()),
 				MsgID:     []byte{1, 2, 3, 4},
 			}
 			tr := &compactionTrigger{
@@ -1929,8 +1932,8 @@ func Test_compactionTrigger_shouldDoSingleCompaction(t *testing.T) {
 		// expireTime is 5000 which is > row timestamps but < commit_timestamp.
 		// Without the fix, rows appear expired. With the fix, commit_timestamp is used as effective ts.
 		now := time.Now()
-		commitTs := tsoutil.ComposeTSByTime(now.Add(24*time.Hour), 0) // future: definitely not expired
-		expireTime := uint64(5000)                                    // > old row ts (1000) but < commitTs
+		commitTs := tsoutil.ComposeTSByTime(now.Add(24 * time.Hour)) // future: definitely not expired
+		expireTime := uint64(5000)                                   // > old row ts (1000) but < commitTs
 
 		var importBinlogs []*datapb.FieldBinlog
 		for i := 0; i < 100; i++ {
@@ -2025,7 +2028,7 @@ func Test_compactionTrigger_ShouldStrictCompactExpiry(t *testing.T) {
 	trigger := &compactionTrigger{}
 
 	now := time.Now()
-	expireTS := tsoutil.ComposeTSByTime(now, 0)
+	expireTS := tsoutil.ComposeTSByTime(now)
 	compact := &compactTime{
 		expireTime: expireTS,
 	}
@@ -2042,13 +2045,13 @@ func Test_compactionTrigger_ShouldStrictCompactExpiry(t *testing.T) {
 	t.Run("no tolerance, fromTs before expire time => should compact", func(t *testing.T) {
 		Params.Save(Params.DataCoordCfg.CompactionExpiryTolerance.Key, "0")
 		defer Params.Save(Params.DataCoordCfg.CompactionExpiryTolerance.Key, "-1") // reset
-		fromTs := tsoutil.ComposeTSByTime(now.Add(-time.Hour), 0)
+		fromTs := tsoutil.ComposeTSByTime(now.Add(-time.Hour))
 		shouldCompact := trigger.ShouldCompactExpiry(fromTs, compact, segment)
 		assert.True(t, shouldCompact)
 	})
 
 	t.Run("negative tolerance, disable force expiry compaction => should not compact", func(t *testing.T) {
-		fromTs := tsoutil.ComposeTSByTime(now.Add(-time.Hour), 0)
+		fromTs := tsoutil.ComposeTSByTime(now.Add(-time.Hour))
 		shouldCompact := trigger.ShouldCompactExpiry(fromTs, compact, segment)
 		assert.False(t, shouldCompact)
 	})
@@ -2057,7 +2060,7 @@ func Test_compactionTrigger_ShouldStrictCompactExpiry(t *testing.T) {
 		Params.Save(Params.DataCoordCfg.CompactionExpiryTolerance.Key, "2")
 		defer Params.Save(Params.DataCoordCfg.CompactionExpiryTolerance.Key, "-1") // reset
 
-		fromTs := tsoutil.ComposeTSByTime(now.Add(-time.Hour), 0) // within 2h tolerance
+		fromTs := tsoutil.ComposeTSByTime(now.Add(-time.Hour)) // within 2h tolerance
 		shouldCompact := trigger.ShouldCompactExpiry(fromTs, compact, segment)
 		assert.False(t, shouldCompact)
 	})
@@ -2065,7 +2068,7 @@ func Test_compactionTrigger_ShouldStrictCompactExpiry(t *testing.T) {
 	t.Run("with tolerance, fromTs before expireTime - tolerance => should compact", func(t *testing.T) {
 		Params.Save(Params.DataCoordCfg.CompactionExpiryTolerance.Key, "2")
 		defer Params.Save(Params.DataCoordCfg.CompactionExpiryTolerance.Key, "-1") // reset
-		fromTs := tsoutil.ComposeTSByTime(now.Add(-3*time.Hour), 0)                // earlier than expireTime - 30m
+		fromTs := tsoutil.ComposeTSByTime(now.Add(-3 * time.Hour))                 // earlier than expireTime - 30m
 		shouldCompact := trigger.ShouldCompactExpiry(fromTs, compact, segment)
 		assert.True(t, shouldCompact)
 	})
@@ -2170,7 +2173,7 @@ func Test_compactionTrigger_getCompactTime(t *testing.T) {
 			common.CollectionTTLConfigKey: "10",
 		},
 	}
-	now := tsoutil.GetCurrentTime()
+	now := tsoutil.ComposeTSByTime(time.Now())
 	ct, err := getCompactTime(now, coll)
 	assert.NoError(t, err)
 	assert.NotNil(t, ct)
@@ -2452,7 +2455,7 @@ func (s *CompactionTriggerSuite) SetupTest() {
 	}
 	s.meta.UpdateChannelCheckpoint(context.TODO(), s.channel, &msgpb.MsgPosition{
 		ChannelName: s.channel,
-		Timestamp:   tsoutil.ComposeTSByTime(time.Now(), 0),
+		Timestamp:   tsoutil.ComposeTSByTime(time.Now()),
 		MsgID:       []byte{1, 2, 3, 4},
 	})
 	s.allocator = allocator.NewMockAllocator(s.T())
@@ -2574,6 +2577,55 @@ func (s *CompactionTriggerSuite) TestHandleSignal() {
 			channel:      s.channel,
 			isForce:      true,
 		})
+	})
+
+	s.Run("force compaction preallocates segment IDs from input size", func() {
+		defer s.SetupTest()
+		pt := paramtable.Get()
+		pt.Save(pt.DataCoordCfg.IndexBasedCompaction.Key, "false")
+		defer pt.Reset(pt.DataCoordCfg.IndexBasedCompaction.Key)
+		pt.Save(pt.DataCoordCfg.CompactionPreAllocateIDExpansionFactor.Key, "1")
+		defer pt.Reset(pt.DataCoordCfg.CompactionPreAllocateIDExpansionFactor.Key)
+		pt.Save(pt.DataCoordCfg.SegmentMaxSize.Key, "100")
+		defer pt.Reset(pt.DataCoordCfg.SegmentMaxSize.Key)
+
+		const mb = 1024 * 1024
+		s.meta.segments.segments[1].Binlogs[0].Binlogs[0].MemorySize = 250 * mb
+
+		tr := s.tr
+		handler := NewNMockHandler(s.T())
+		handler.EXPECT().GetCollection(mock.Anything, s.collectionID).
+			Return(&collectionInfo{
+				ID: s.collectionID,
+				Schema: &schemapb.CollectionSchema{
+					Fields: []*schemapb.FieldSchema{
+						{FieldID: s.vecFieldID, DataType: schemapb.DataType_FloatVector},
+					},
+				},
+			}, nil).Once()
+		tr.handler = handler
+
+		const (
+			startID = int64(20000)
+			planID  = int64(20003)
+			endID   = int64(20004)
+		)
+		s.allocator.EXPECT().AllocN(int64(4)).Return(startID, endID, nil).Once()
+		s.inspector.EXPECT().enqueueCompaction(mock.MatchedBy(func(task *datapb.CompactionTask) bool {
+			s.EqualValues(planID, task.GetPlanID())
+			s.ElementsMatch([]int64{1}, task.GetInputSegments())
+			s.EqualValues(startID, task.GetPreAllocatedSegmentIDs().GetBegin())
+			s.EqualValues(planID, task.GetPreAllocatedSegmentIDs().GetEnd())
+			return true
+		})).Return(nil).Once()
+
+		err := tr.handleSignal(NewCompactionSignal().
+			WithCollectionID(s.collectionID).
+			WithPartitionID(s.partitionID).
+			WithChannel(s.channel).
+			WithSegmentIDs(1).
+			WithIsForce(true))
+		s.NoError(err)
 	})
 }
 
@@ -2711,7 +2763,7 @@ func (s *CompactionTriggerSuite) TestSqueezeSmallSegments() {
 
 	s.Equal(1, len(buckets))
 	s.Equal(2, len(buckets[0]))
-	log.Info("buckets", zap.Any("buckets", buckets))
+	mlog.Info(context.TODO(), "buckets", mlog.Any("buckets", buckets))
 }
 
 func TestCompactionTriggerSuite(t *testing.T) {
@@ -3277,12 +3329,12 @@ func Test_compactionTrigger_ShouldCompactExpiryWithTTLField(t *testing.T) {
 		},
 	}
 
-	startTime := tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	startTime := tsoutil.ComposeTSByTime(ts.Add(time.Minute))
 	ct := &compactTime{startTime: startTime, collectionTTL: 0}
 	shouldCompact := trigger.ShouldCompactExpiryWithTTLField(ct, segment)
 	assert.True(t, shouldCompact)
 
-	startTime = tsoutil.ComposeTSByTime(ts.Add(-1*time.Hour), 0)
+	startTime = tsoutil.ComposeTSByTime(ts.Add(-1 * time.Hour))
 	ct = &compactTime{startTime: startTime, collectionTTL: 0}
 	shouldCompact = trigger.ShouldCompactExpiryWithTTLField(ct, segment)
 	assert.False(t, shouldCompact)
@@ -3290,13 +3342,13 @@ func Test_compactionTrigger_ShouldCompactExpiryWithTTLField(t *testing.T) {
 	origin := Params.DataCoordCfg.SingleCompactionRatioThreshold.GetValue()
 	defer Params.Save(Params.DataCoordCfg.SingleCompactionRatioThreshold.Key, origin)
 	Params.Save(Params.DataCoordCfg.SingleCompactionRatioThreshold.Key, "0.1")
-	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute))
 	ct = &compactTime{startTime: startTime, collectionTTL: 0}
 	shouldCompact = trigger.ShouldCompactExpiryWithTTLField(ct, segment)
 	assert.True(t, shouldCompact)
 
 	Params.Save(Params.DataCoordCfg.SingleCompactionRatioThreshold.Key, "5")
-	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute))
 	ct = &compactTime{startTime: startTime, collectionTTL: 0}
 	shouldCompact = trigger.ShouldCompactExpiryWithTTLField(ct, segment)
 	assert.False(t, shouldCompact)
@@ -3314,7 +3366,7 @@ func Test_compactionTrigger_ShouldCompactExpiryWithTTLField(t *testing.T) {
 		},
 	}
 
-	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	startTime = tsoutil.ComposeTSByTime(ts.Add(time.Minute))
 	ct = &compactTime{startTime: startTime, collectionTTL: 0}
 	shouldCompact = trigger.ShouldCompactExpiryWithTTLField(ct, segment2)
 	assert.False(t, shouldCompact)
@@ -3330,7 +3382,7 @@ func Test_compactionTrigger_ShouldCompactExpiryWithTTLField_CommitTimestamp(t *t
 		SegmentInfo: &datapb.SegmentInfo{
 			ID:              1,
 			CollectionID:    2,
-			CommitTimestamp: tsoutil.ComposeTSByTime(ts, 0), // import segment
+			CommitTimestamp: tsoutil.ComposeTSByTime(ts),
 			ExpirQuantiles: []int64{
 				oldTs.UnixMicro(),
 				oldTs.Add(time.Minute).UnixMicro(),
@@ -3343,7 +3395,7 @@ func Test_compactionTrigger_ShouldCompactExpiryWithTTLField_CommitTimestamp(t *t
 
 	// expirQuantiles are based on original row timestamps; ShouldCompactExpiryWithTTLField
 	// does not adjust for commit_timestamp, so stale quantiles still trigger compaction.
-	startTime := tsoutil.ComposeTSByTime(ts.Add(time.Minute), 0)
+	startTime := tsoutil.ComposeTSByTime(ts.Add(time.Minute))
 	ct := &compactTime{startTime: startTime, collectionTTL: 0}
 	shouldCompact := trigger.ShouldCompactExpiryWithTTLField(ct, segment)
 	assert.True(t, shouldCompact, "stale expirQuantiles should still trigger TTL compaction")

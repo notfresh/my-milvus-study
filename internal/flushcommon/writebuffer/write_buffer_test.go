@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
@@ -18,6 +19,7 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/metacache/pkoracle"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/function"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
@@ -69,11 +71,57 @@ func (s *WriteBufferSuite) SetupTest() {
 func (s *WriteBufferSuite) TestHasSegment() {
 	segmentID := int64(1001)
 
+	s.wb.useGrowingSourceFlush = false
 	s.False(s.wb.HasSegment(segmentID))
 
 	s.wb.getOrCreateBuffer(segmentID, 0)
 
 	s.True(s.wb.HasSegment(segmentID))
+}
+
+func (s *WriteBufferSuite) TestFlushSourceModeNotifier() {
+	segmentID := int64(1001)
+	var notifiedSegmentID int64
+	var notifiedMode metacache.FlushSourceMode
+	s.wb.flushSourceModeNotifier = func(segmentID int64, mode metacache.FlushSourceMode) {
+		notifiedSegmentID = segmentID
+		notifiedMode = mode
+	}
+
+	s.Run("write_buffer_mode", func() {
+		segment := metacache.NewSegmentInfo(&datapb.SegmentInfo{ID: segmentID}, nil, nil)
+		metacache.SetFlushSourceMode(metacache.FlushSourceWriteBuffer)(segment)
+		s.metacache.EXPECT().UpdateSegments(mock.Anything, mock.Anything).Run(func(action metacache.SegmentAction, _ ...metacache.SegmentFilter) {
+			action(segment)
+		}).Return().Once()
+		s.metacache.EXPECT().GetSegmentByID(segmentID).Return(segment, true).Once()
+
+		s.wb.useGrowingSourceFlush = true
+		s.wb.getOrCreateBuffer(segmentID, 0)
+		s.Equal(segmentID, notifiedSegmentID)
+		s.Equal(metacache.FlushSourceWriteBuffer, notifiedMode)
+	})
+
+	s.Run("growing_mode", func() {
+		segmentID := int64(1002)
+		segment := metacache.NewSegmentInfo(&datapb.SegmentInfo{ID: segmentID}, nil, nil)
+		notifiedSegmentID = 0
+		notifiedMode = metacache.FlushSourceUnknown
+		s.metacache.EXPECT().GetSegmentByID(segmentID).Return(nil, false).Once()
+		s.metacache.EXPECT().AddSegment(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return().Once()
+		s.metacache.EXPECT().UpdateSegments(mock.Anything, mock.Anything).Run(func(action metacache.SegmentAction, _ ...metacache.SegmentFilter) {
+			action(segment)
+		}).Return().Once()
+		s.metacache.EXPECT().GetSegmentByID(segmentID).Return(segment, true).Once()
+
+		s.wb.recordGrowingSourceProgress(&InsertData{
+			segmentID:   segmentID,
+			partitionID: 10,
+			rowNum:      3,
+		}, &msgpb.MsgPosition{Timestamp: 100}, &msgpb.MsgPosition{Timestamp: 200}, 1, 3)
+		s.Equal(segmentID, notifiedSegmentID)
+		s.Equal(metacache.FlushSourceGrowing, notifiedMode)
+	})
 }
 
 func (s *WriteBufferSuite) TestCreateNewGrowingSegmentStorageVersion() {
@@ -418,6 +466,147 @@ func (s *WriteBufferSuite) TestEvictBuffer() {
 		wb.EvictBuffer(GetOldestBufferPolicy(1))
 	})
 
+	s.Run("sync_submit_outside_lock", func() {
+		buf, err := newSegmentBuffer(4, s.collSchema)
+		s.Require().NoError(err)
+		buf.insertBuffer.startPos = &msgpb.MsgPosition{Timestamp: 440}
+		buf.deltaBuffer.startPos = &msgpb.MsgPosition{Timestamp: 400}
+
+		wb.mut.Lock()
+		wb.buffers[4] = buf
+		wb.checkpoint = &msgpb.MsgPosition{Timestamp: 1000}
+		wb.mut.Unlock()
+
+		segment := metacache.NewSegmentInfo(&datapb.SegmentInfo{
+			ID: 4,
+		}, nil, nil)
+		s.metacache.EXPECT().GetSegmentByID(int64(4)).Return(segment, true)
+		s.metacache.EXPECT().UpdateSegments(mock.Anything, mock.Anything).Return()
+
+		submitEntered := make(chan struct{})
+		releaseSubmit := make(chan struct{})
+		s.syncMgr.EXPECT().SyncData(mock.Anything, mock.MatchedBy(func(task syncmgr.Task) bool {
+			return task != nil && task.SegmentID() == 4
+		}), mock.Anything).RunAndReturn(
+			func(context.Context, syncmgr.Task, ...func(error) error) (*conc.Future[struct{}], error) {
+				close(submitEntered)
+				<-releaseSubmit
+				return conc.Go[struct{}](func() (struct{}, error) {
+					return struct{}{}, nil
+				}), nil
+			},
+		).Once()
+
+		evictDone := make(chan struct{})
+		go func() {
+			defer close(evictDone)
+			wb.EvictBuffer(GetOldestBufferPolicy(1))
+		}()
+
+		select {
+		case <-submitEntered:
+		case <-time.After(3 * time.Second):
+			s.FailNow("SyncData should be called before checking the write buffer lock")
+		}
+
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			_ = wb.MemorySize()
+		}()
+
+		select {
+		case <-readDone:
+		case <-time.After(3 * time.Second):
+			s.FailNow("write buffer read lock should not be blocked by SyncData submit")
+		}
+
+		close(releaseSubmit)
+		select {
+		case <-evictDone:
+		case <-time.After(3 * time.Second):
+			s.FailNow("EvictBuffer should finish after SyncData submit is released")
+		}
+	})
+
+	s.Run("drop_close_sync_submit_outside_lock", func() {
+		syncMgr := syncmgr.NewMockSyncManager(s.T())
+		metaCache := metacache.NewMockMetaCache(s.T())
+		metaWriter := syncmgr.NewMockMetaWriter(s.T())
+		metaCache.EXPECT().GetSchema(mock.Anything).Return(s.collSchema).Maybe()
+		metaCache.EXPECT().Collection().Return(s.collID).Maybe()
+
+		closeWB, err := newWriteBufferBase(s.channelName, metaCache, syncMgr, &writeBufferOption{
+			metaWriter: metaWriter,
+			pkStatsFactory: func(vchannel *datapb.SegmentInfo) pkoracle.PkStat {
+				return pkoracle.NewBloomFilterSet()
+			},
+		})
+		s.Require().NoError(err)
+
+		buf, err := newSegmentBuffer(5, s.collSchema)
+		s.Require().NoError(err)
+		buf.insertBuffer.startPos = &msgpb.MsgPosition{Timestamp: 540}
+		buf.deltaBuffer.startPos = &msgpb.MsgPosition{Timestamp: 500}
+
+		closeWB.mut.Lock()
+		closeWB.buffers[5] = buf
+		closeWB.checkpoint = &msgpb.MsgPosition{Timestamp: 1000}
+		closeWB.mut.Unlock()
+
+		segment := metacache.NewSegmentInfo(&datapb.SegmentInfo{
+			ID: 5,
+		}, nil, nil)
+		metaCache.EXPECT().GetSegmentByID(int64(5)).Return(segment, true)
+		metaCache.EXPECT().UpdateSegments(mock.Anything, mock.Anything).Return()
+
+		submitEntered := make(chan struct{})
+		releaseSubmit := make(chan struct{})
+		syncMgr.EXPECT().SyncData(mock.Anything, mock.MatchedBy(func(task syncmgr.Task) bool {
+			return task != nil && task.SegmentID() == 5 && task.IsDrop()
+		}), mock.Anything).RunAndReturn(
+			func(context.Context, syncmgr.Task, ...func(error) error) (*conc.Future[struct{}], error) {
+				close(submitEntered)
+				<-releaseSubmit
+				return conc.Go[struct{}](func() (struct{}, error) {
+					return struct{}{}, nil
+				}), nil
+			},
+		).Once()
+		metaWriter.EXPECT().DropChannel(mock.Anything, s.channelName).Return(nil).Once()
+
+		closeDone := make(chan struct{})
+		go func() {
+			defer close(closeDone)
+			closeWB.Close(context.Background(), true)
+		}()
+
+		select {
+		case <-submitEntered:
+		case <-time.After(3 * time.Second):
+			s.FailNow("SyncData should be called before checking the write buffer lock")
+		}
+
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			_ = closeWB.MemorySize()
+		}()
+
+		select {
+		case <-readDone:
+		case <-time.After(3 * time.Second):
+			s.FailNow("write buffer read lock should not be blocked by Close SyncData submit")
+		}
+
+		close(releaseSubmit)
+		select {
+		case <-closeDone:
+		case <-time.After(3 * time.Second):
+			s.FailNow("Close should finish after SyncData submit is released")
+		}
+	})
+
 	s.Run("await_outside_lock", func() {
 		mockAllocator := allocator.NewMockAllocator(s.T())
 		var nextSegmentID atomic.Int64
@@ -544,9 +733,9 @@ func (s *WriteBufferSuite) TestGrowingSourceProgressSelectedByPolicy() {
 	}()
 
 	now := time.Now()
-	recentTs := tsoutil.ComposeTSByTime(now.Add(500*time.Millisecond), 0)
-	staleTs := tsoutil.ComposeTSByTime(now.Add(2*time.Second), 0)
-	startTs := tsoutil.ComposeTSByTime(now, 0)
+	recentTs := tsoutil.ComposeTSByTime(now.Add(500 * time.Millisecond))
+	staleTs := tsoutil.ComposeTSByTime(now.Add(2 * time.Second))
+	startTs := tsoutil.ComposeTSByTime(now)
 
 	s.Run("pending_flush", func() {
 		selected := s.wb.growingSourceProgressSelectedByPolicy(recentTs, 1001, &growingSourceProgress{
@@ -554,6 +743,15 @@ func (s *WriteBufferSuite) TestGrowingSourceProgressSelectedByPolicy() {
 			pendingFlush: true,
 		})
 		s.True(selected)
+	})
+
+	s.Run("non_retryable_failure", func() {
+		selected := s.wb.growingSourceProgressSelectedByPolicy(recentTs, 1007, &growingSourceProgress{
+			segmentID:           1007,
+			pendingFlush:        true,
+			nonRetryableFailure: true,
+		})
+		s.False(selected)
 	})
 
 	s.Run("sealed_segment", func() {
@@ -621,6 +819,39 @@ func (s *WriteBufferSuite) TestGrowingSourceProgressSelectedByPolicy() {
 		})
 		s.True(selected)
 	})
+}
+
+func (s *WriteBufferSuite) TestGrowingSourceLayoutMismatch() {
+	s.True(isGrowingSourceLayoutMismatch(errors.New("flush growing source data: Invalid: Column count mismatch at index 0: existing has 21 columns, but appended has 44 columns: segcore error[segcoreCode=2001]")))
+	s.True(isGrowingSourceLayoutMismatch(errors.New("flush growing source data: Invalid: Column group size mismatch: existing has 10 groups, but appended has 1 groups: segcore error[segcoreCode=2001]")))
+	s.False(isGrowingSourceLayoutMismatch(errors.New("flush growing source data: mock transient error")))
+	s.False(isGrowingSourceLayoutMismatch(nil))
+}
+
+func (s *WriteBufferSuite) TestGrowingSourceProgressSyncableSkipsNonRetryableFailure() {
+	syncable, retry := s.wb.growingSourceProgressSyncable(1001, &growingSourceProgress{
+		segmentID:           1001,
+		nonRetryableFailure: true,
+		batches: []growingSourceProgressBatch{
+			{endPosition: &msgpb.MsgPosition{Timestamp: 100}, endOffset: 10},
+		},
+	}, false, true)
+	s.False(syncable)
+	s.False(retry)
+}
+
+func (s *WriteBufferSuite) TestGrowingSourceProgressRetrySkipsNonRetryableFailure() {
+	s.wb.growingSourceProgress[1001] = &growingSourceProgress{
+		segmentID:           1001,
+		nonRetryableFailure: true,
+		batches: []growingSourceProgressBatch{
+			{endPosition: &msgpb.MsgPosition{Timestamp: 100}, endOffset: 10},
+		},
+	}
+
+	segments, retry := s.wb.getGrowingSourceSegmentsToRetry()
+	s.Empty(segments)
+	s.False(retry)
 }
 
 func (s *WriteBufferSuite) TestDropPartitions() {
@@ -787,4 +1018,101 @@ func TestPrepareInsertWithMissingFields(t *testing.T) {
 			assert.Equal(t, "default_string", insertData.Data[103].GetRow(i))
 		}
 	})
+}
+
+func TestPrepareInsertMaterializesLegacyBM25Output(t *testing.T) {
+	collSchema := &schemapb.CollectionSchema{
+		Name: "bm25_collection",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: common.RowIDField, Name: common.RowIDFieldName, DataType: schemapb.DataType_Int64},
+			{FieldID: common.TimeStampField, Name: common.TimeStampFieldName, DataType: schemapb.DataType_Int64},
+			{
+				FieldID:      100,
+				Name:         "pk",
+				DataType:     schemapb.DataType_Int64,
+				IsPrimaryKey: true,
+			},
+			{
+				FieldID:  101,
+				Name:     "text",
+				DataType: schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: "max_length", Value: "1024"},
+				},
+			},
+			{
+				FieldID:          102,
+				Name:             "sparse",
+				DataType:         schemapb.DataType_SparseFloatVector,
+				IsFunctionOutput: true,
+			},
+		},
+		Functions: []*schemapb.FunctionSchema{
+			{
+				Name:           "bm25",
+				Type:           schemapb.FunctionType_BM25,
+				InputFieldIds:  []int64{101},
+				OutputFieldIds: []int64{102},
+			},
+			{
+				Name:          "rerank",
+				Type:          schemapb.FunctionType_Rerank,
+				InputFieldIds: []int64{101},
+			},
+		},
+	}
+	pkField := collSchema.GetFields()[2]
+	insertMsg := &msgstream.InsertMsg{
+		BaseMsg: msgstream.BaseMsg{
+			BeginTimestamp: 1000,
+			EndTimestamp:   1002,
+		},
+		InsertRequest: &msgpb.InsertRequest{
+			SegmentID:    1,
+			PartitionID:  1,
+			CollectionID: 1,
+			NumRows:      3,
+			Version:      msgpb.InsertDataVersion_ColumnBased,
+			RowIDs:       []int64{10, 11, 12},
+			Timestamps:   []uint64{1000, 1001, 1002},
+			FieldsData: []*schemapb.FieldData{
+				{
+					FieldId: 100,
+					Type:    schemapb.DataType_Int64,
+					Field: &schemapb.FieldData_Scalars{
+						Scalars: &schemapb.ScalarField{
+							Data: &schemapb.ScalarField_LongData{
+								LongData: &schemapb.LongArray{Data: []int64{1, 2, 3}},
+							},
+						},
+					},
+				},
+				{
+					FieldId: 101,
+					Type:    schemapb.DataType_VarChar,
+					Field: &schemapb.FieldData_Scalars{
+						Scalars: &schemapb.ScalarField{
+							Data: &schemapb.ScalarField_StringData{
+								StringData: &schemapb.StringArray{Data: []string{"hello world", "milvus bm25", "legacy message"}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	assert.NoError(t, function.AllocFunctionRunners(1, "v1", collSchema))
+	_, err := function.FillFunctionData(context.Background(), 1, collSchema, insertMsg.InsertRequest)
+	assert.NoError(t, err)
+	defer function.ReleaseFunctionRunners(1, "v1")
+
+	result, err := PrepareInsert(collSchema, pkField, []*msgstream.InsertMsg{insertMsg})
+
+	assert.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Contains(t, result[0].bm25Stats, int64(102))
+	assert.Equal(t, int64(3), result[0].bm25Stats[102].NumRow())
+	assert.NotNil(t, insertMsg.GetFieldsData()[2])
+	assert.Equal(t, int64(102), insertMsg.GetFieldsData()[2].GetFieldId())
 }

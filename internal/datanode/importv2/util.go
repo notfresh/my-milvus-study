@@ -26,7 +26,6 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
@@ -38,8 +37,8 @@ import (
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -50,7 +49,7 @@ import (
 )
 
 func WrapTaskNotFoundError(taskID int64) error {
-	return merr.WrapErrImportFailed(fmt.Sprintf("cannot find import task with id %d", taskID))
+	return merr.WrapErrImportSysFailedMsg("cannot find import task with id %d", taskID)
 }
 
 func NewSyncTask(ctx context.Context,
@@ -151,7 +150,7 @@ func PickSegment(segments []*datapb.ImportRequestSegment, vchannel string, parti
 	})
 
 	if len(candidates) == 0 {
-		return 0, fmt.Errorf("no candidate segments found for channel %s and partition %d",
+		return 0, merr.WrapErrServiceInternalMsg("no candidate segments found for channel %s and partition %d",
 			vchannel, partitionID)
 	}
 
@@ -392,7 +391,7 @@ func AppendNullableDefaultFieldsData(schema *schemapb.CollectionSchema, data *st
 				}
 			}
 		default:
-			return fmt.Errorf("unexpected data type: %d, cannot be filled with default value", dataType)
+			return merr.WrapErrServiceInternalMsg("unexpected data type: %d, cannot be filled with default value", dataType)
 		}
 
 		if err != nil {
@@ -409,7 +408,7 @@ func FillDynamicData(schema *schemapb.CollectionSchema, data *storage.InsertData
 	}
 	dynamicField := typeutil.GetDynamicField(schema)
 	if dynamicField == nil {
-		return merr.WrapErrImportFailed("collection schema is illegal, enable_dynamic_field is true but the dynamic field doesn't exist")
+		return merr.WrapErrImportSysFailed("collection schema is illegal, enable_dynamic_field is true but the dynamic field doesn't exist")
 	}
 
 	tempData, ok := data.Data[dynamicField.GetFieldID()]
@@ -441,7 +440,7 @@ func FillDynamicData(schema *schemapb.CollectionSchema, data *storage.InsertData
 }
 
 func RunEmbeddingFunction(task *ImportTask, data *storage.InsertData) error {
-	log.Info("start to run embedding function")
+	mlog.Info(context.TODO(), "start to run embedding function")
 	schema := task.GetSchema()
 	allowNonBM25Outputs := common.GetCollectionAllowInsertNonBM25FunctionOutputs(schema.GetProperties())
 	if err := embedding.RunAll(context.Background(), schema, data, embedding.RunOptions{
@@ -502,11 +501,11 @@ func LogStats(manager TaskManager) {
 		byState := lo.GroupBy(tasks, func(t Task) datapb.ImportTaskStateV2 {
 			return t.GetState()
 		})
-		log.Info("import task stats", zap.String("type", taskType.String()),
-			zap.Int("pending", len(byState[datapb.ImportTaskStateV2_Pending])),
-			zap.Int("inProgress", len(byState[datapb.ImportTaskStateV2_InProgress])),
-			zap.Int("completed", len(byState[datapb.ImportTaskStateV2_Completed])),
-			zap.Int("failed", len(byState[datapb.ImportTaskStateV2_Failed])))
+		mlog.Info(context.TODO(), "import task stats", mlog.String("type", taskType.String()),
+			mlog.Int("pending", len(byState[datapb.ImportTaskStateV2_Pending])),
+			mlog.Int("inProgress", len(byState[datapb.ImportTaskStateV2_InProgress])),
+			mlog.Int("completed", len(byState[datapb.ImportTaskStateV2_Completed])),
+			mlog.Int("failed", len(byState[datapb.ImportTaskStateV2_Failed])))
 	}
 	tasks := manager.GetBy(WithType(PreImportTaskType))
 	logFunc(tasks, PreImportTaskType)

@@ -18,7 +18,6 @@ package datacoord
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -345,7 +344,19 @@ func (m *importMeta) HandleCommitVchannel(ctx context.Context, jobID int64, vcha
 
 	job := m.jobs[jobID]
 	if job == nil {
-		return merr.WrapErrImportFailed(fmt.Sprintf("job %d not found", jobID))
+		return merr.WrapErrImportSysFailedMsg("job %d not found", jobID)
+	}
+	switch job.GetState() {
+	case internalpb.ImportJobState_Uncommitted, internalpb.ImportJobState_Committing:
+		// continue
+	case internalpb.ImportJobState_Completed, internalpb.ImportJobState_Failed:
+		return nil
+	default:
+		// Do not record committed_vchannels while the import task is still
+		// importing. The caller must retry after the job becomes Uncommitted;
+		// otherwise a later retry would treat this vchannel as committed even
+		// though the visibility callback has not run.
+		return merr.WrapErrImportSysFailedMsg("job %d is in state %s, waiting for Uncommitted", jobID, job.GetState())
 	}
 	// Idempotency: if vchannel already committed, skip.
 	for _, c := range job.GetCommittedVchannels() {

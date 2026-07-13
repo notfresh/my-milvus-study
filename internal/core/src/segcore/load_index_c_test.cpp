@@ -45,6 +45,8 @@
 #include "knowhere/index/index_factory.h"
 #include "knowhere/version.h"
 #include "pb/common.pb.h"
+#include "pb/cgo_msg.pb.h"
+#include "pb/index_coord.pb.h"
 #include "pb/plan.pb.h"
 #include "query/PlanImpl.h"
 #include "query/PlanNode.h"
@@ -53,8 +55,12 @@
 #include "segcore/SegmentSealed.h"
 #include "segcore/Types.h"
 #include "segcore/collection_c.h"
+#include "segcore/load_index_c.h"
 #include "segcore/plan_c.h"
 #include "segcore/segment_c.h"
+#include "storage/DiskFileManagerImpl.h"
+#include "storage/LocalChunkManagerSingleton.h"
+#include "storage/Util.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/GenExprProto.h"
 #include "test_utils/PbHelper.h"
@@ -71,6 +77,123 @@ using namespace knowhere;
 
 const int64_t ROW_COUNT = 10 * 1000;
 const int64_t BIAS = 4200;
+
+namespace {
+
+class LocalDirOwningIndex : public milvus::index::IndexBase {
+ public:
+    explicit LocalDirOwningIndex(
+        const milvus::storage::FileManagerContext& file_manager_context)
+        : IndexBase("LOCAL_DIR_OWNING"),
+          disk_file_manager_(
+              std::make_shared<milvus::storage::DiskFileManagerImpl>(
+                  file_manager_context)),
+          local_index_prefix_(disk_file_manager_->GetLocalIndexObjectPrefix()) {
+    }
+
+    const std::string&
+    LocalIndexPrefix() const {
+        return local_index_prefix_;
+    }
+
+    milvus::BinarySet
+    Serialize(const milvus::Config& /*config*/) override {
+        return {};
+    }
+
+    void
+    Load(const milvus::BinarySet& /*binary_set*/,
+         const milvus::Config& /*config*/ = {}) override {
+    }
+
+    void
+    Load(milvus::tracer::TraceContext /*ctx*/,
+         const milvus::Config& /*config*/ = {}) override {
+    }
+
+    void
+    BuildWithRawDataForUT(size_t /*n*/,
+                          const void* /*values*/,
+                          const milvus::Config& /*config*/ = {}) override {
+    }
+
+    void
+    BuildWithDataset(const milvus::DatasetPtr& /*dataset*/,
+                     const milvus::Config& /*config*/ = {}) override {
+    }
+
+    void
+    Build(const milvus::Config& /*config*/ = {}) override {
+    }
+
+    int64_t
+    Count() override {
+        return 0;
+    }
+
+    milvus::index::IndexStatsPtr
+    Upload(const milvus::Config& /*config*/ = {}) override {
+        return nullptr;
+    }
+
+    const bool
+    HasRawData() const override {
+        return false;
+    }
+
+    bool
+    IsMmapSupported() const override {
+        return false;
+    }
+
+ private:
+    std::shared_ptr<milvus::storage::DiskFileManagerImpl> disk_file_manager_;
+    std::string local_index_prefix_;
+};
+
+milvus::storage::FileManagerContext
+MakeFileManagerContext(const milvus::segcore::LoadIndexInfo& load_index_info) {
+    auto local_chunk_manager =
+        milvus::storage::LocalChunkManagerSingleton::GetInstance()
+            .GetChunkManager();
+
+    milvus::proto::schema::FieldSchema field_schema;
+    field_schema.set_fieldid(load_index_info.field_id);
+    field_schema.set_data_type(milvus::proto::schema::DataType::FloatVector);
+
+    milvus::storage::FieldDataMeta field_meta{load_index_info.collection_id,
+                                              load_index_info.partition_id,
+                                              load_index_info.segment_id,
+                                              load_index_info.field_id,
+                                              field_schema};
+    milvus::storage::IndexMeta index_meta{load_index_info.segment_id,
+                                          load_index_info.field_id,
+                                          load_index_info.index_build_id,
+                                          load_index_info.index_version,
+                                          "clean_loaded_index",
+                                          "vector",
+                                          milvus::DataType::VECTOR_FLOAT,
+                                          DIM,
+                                          false};
+    return milvus::storage::FileManagerContext(
+        field_meta, index_meta, local_chunk_manager, nullptr);
+}
+
+std::pair<std::unique_ptr<LocalDirOwningIndex>, std::string>
+CreateLocalDirOwningIndexFile(
+    const milvus::storage::FileManagerContext& file_manager_context,
+    const std::string& file_name) {
+    auto local_chunk_manager =
+        milvus::storage::LocalChunkManagerSingleton::GetInstance()
+            .GetChunkManager();
+    auto index = std::make_unique<LocalDirOwningIndex>(file_manager_context);
+    auto local_file = index->LocalIndexPrefix() + file_name;
+    local_chunk_manager->CreateFile(local_file);
+    EXPECT_TRUE(local_chunk_manager->Exist(local_file));
+    return {std::move(index), local_file};
+}
+
+}  // namespace
 
 auto
 generate_data(int N) {
@@ -145,6 +268,82 @@ TEST(CApiTest, LoadIndexSearch) {
         knowhere::GenDataSet(num_query, DIM, raw_data.data() + BIAS * DIM);
 
     auto result = indexing.Search(query_dataset, conf, nullptr);
+}
+
+TEST(LoadIndexCTest, FinishLoadIndexInfoPreservesIndexStorePathVersion) {
+    milvus::proto::cgo::LoadIndexInfo proto;
+    proto.set_collectionid(100);
+    proto.set_partitionid(20);
+    proto.set_segmentid(30);
+    auto* field = proto.mutable_field();
+    field->set_fieldid(100);
+    field->set_name("vec");
+    field->set_data_type(milvus::proto::schema::DataType::FloatVector);
+    auto* dim_param = field->add_type_params();
+    dim_param->set_key("dim");
+    dim_param->set_value("128");
+    proto.set_indexid(50);
+    proto.set_index_buildid(60);
+    proto.set_index_version(1);
+    proto.set_index_engine_version(1);
+    proto.set_index_file_size(1024);
+    proto.set_num_rows(1000);
+    proto.set_index_store_path_version(
+        milvus::proto::index::IndexStorePathVersion::
+            INDEX_STORE_PATH_VERSION_COLLECTION_ROOTED);
+
+    std::string serialized;
+    ASSERT_TRUE(proto.SerializeToString(&serialized));
+
+    milvus::segcore::LoadIndexInfo load_index_info;
+    auto status =
+        FinishLoadIndexInfo(static_cast<CLoadIndexInfo>(&load_index_info),
+                            reinterpret_cast<const uint8_t*>(serialized.data()),
+                            serialized.size());
+
+    ASSERT_EQ(status.error_code, milvus::Success);
+    EXPECT_EQ(load_index_info.index_store_path_version,
+              milvus::proto::index::IndexStorePathVersion::
+                  INDEX_STORE_PATH_VERSION_COLLECTION_ROOTED);
+}
+
+TEST(LoadIndexCTest, CleanLoadedIndexDoesNotRemoveSiblingGeneration) {
+    auto local_chunk_manager =
+        milvus::storage::LocalChunkManagerSingleton::GetInstance()
+            .GetChunkManager();
+
+    milvus::segcore::LoadIndexInfo load_index_info;
+    load_index_info.collection_id = 100;
+    load_index_info.partition_id = 20;
+    load_index_info.segment_id = 30;
+    load_index_info.field_id = 40;
+    load_index_info.index_build_id = 50;
+    load_index_info.index_version = 1;
+    load_index_info.field_type = milvus::DataType::VECTOR_FLOAT;
+    load_index_info.dim = DIM;
+
+    auto file_manager_context = MakeFileManagerContext(load_index_info);
+    auto [index, index_file] =
+        CreateLocalDirOwningIndexFile(file_manager_context, "index_data");
+    auto [cache_index, cache_index_file] =
+        CreateLocalDirOwningIndexFile(file_manager_context, "cache_index_data");
+    auto [sibling_index, sibling_file] = CreateLocalDirOwningIndexFile(
+        file_manager_context, "sibling_index_data");
+    load_index_info.index = std::move(index);
+    load_index_info.cache_index = CreateTestCacheIndex(
+        "clean_loaded_index_cache", std::move(cache_index));
+    ASSERT_TRUE(local_chunk_manager->Exist(index_file));
+    ASSERT_TRUE(local_chunk_manager->Exist(cache_index_file));
+    ASSERT_NE(sibling_index, nullptr);
+    ASSERT_TRUE(local_chunk_manager->Exist(sibling_file));
+
+    auto status =
+        CleanLoadedIndex(static_cast<CLoadIndexInfo>(&load_index_info));
+
+    ASSERT_EQ(status.error_code, milvus::Success);
+    EXPECT_TRUE(local_chunk_manager->Exist(sibling_file));
+    EXPECT_FALSE(local_chunk_manager->Exist(index_file));
+    EXPECT_FALSE(local_chunk_manager->Exist(cache_index_file));
 }
 
 template <class TraitType>

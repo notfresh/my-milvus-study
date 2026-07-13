@@ -2,10 +2,10 @@ package rootcoord
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -17,7 +17,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/proxypb"
@@ -46,6 +46,14 @@ func (c *Core) broadcastAlterCollectionForAlterCollection(ctx context.Context, r
 
 	if hookutil.ContainsCipherProperties(req.GetProperties(), req.GetDeleteKeys()) {
 		return merr.WrapErrParameterInvalidMsg("can not alter cipher related properties")
+	}
+
+	if err := common.ValidateNamespaceShardingEnabledNotAltered(req.GetProperties(), req.GetDeleteKeys()); err != nil {
+		return err
+	}
+
+	if err := validateNamespaceModeImmutable(req.GetProperties(), req.GetDeleteKeys()); err != nil {
+		return err
 	}
 
 	if funcutil.SliceContain(req.GetDeleteKeys(), common.EnableDynamicSchemaKey) {
@@ -200,6 +208,26 @@ func (c *Core) broadcastAlterCollectionForAlterCollection(ctx context.Context, r
 		MustBuildBroadcast()
 	if _, err := broadcaster.Broadcast(ctx, msg); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateNamespaceModeImmutable(properties []*commonpb.KeyValuePair, deleteKeys []string) error {
+	for _, prop := range properties {
+		if prop.GetKey() == common.NamespaceModeKey {
+			return merr.WrapErrParameterInvalidMsg("cannot alter %s via alter_collection_properties; namespace mode is immutable after collection creation", common.NamespaceModeKey)
+		}
+		if strings.EqualFold(prop.GetKey(), common.NamespaceModeKey) {
+			return merr.WrapErrParameterInvalidMsg("invalid property key %q, did you mean %q?", prop.GetKey(), common.NamespaceModeKey)
+		}
+	}
+	for _, key := range deleteKeys {
+		if key == common.NamespaceModeKey {
+			return merr.WrapErrParameterInvalidMsg("cannot delete %s; namespace mode is immutable after collection creation", common.NamespaceModeKey)
+		}
+		if strings.EqualFold(key, common.NamespaceModeKey) {
+			return merr.WrapErrParameterInvalidMsg("invalid property key %q, did you mean %q?", key, common.NamespaceModeKey)
+		}
 	}
 	return nil
 }
@@ -408,10 +436,22 @@ func (c *DDLCallback) alterCollectionV2AckCallback(ctx context.Context, result m
 	body := result.Message.MustBody()
 	if err := c.meta.AlterCollection(ctx, result); err != nil {
 		if errors.Is(err, errAlterCollectionNotFound) {
-			log.Ctx(ctx).Warn("alter a non-existent collection, ignore it", log.FieldMessage(result.Message))
+			mlog.Warn(ctx, "alter a non-existent collection, ignore it", mlog.FieldMessage(result.Message))
 			return nil
 		}
-		return errors.Wrap(err, "failed to alter collection")
+		return merr.Wrap(err, "failed to alter collection")
+	}
+	// Refresh datacoord's cached collection schema BEFORE the bound index meta
+	// becomes visible: creating the index signals the index inspector, whose
+	// function-output-field guard reads that cached schema — on a stale view it
+	// would schedule doomed builds on segments that have no binlog for the new
+	// field yet. The schema push depends only on rootcoord meta (updated above),
+	// never on index meta, so this order is always safe.
+	if err := c.broker.BroadcastAlteredCollection(ctx, header.CollectionId); err != nil {
+		return merr.Wrap(err, "failed to broadcast altered collection")
+	}
+	if err := c.applyBoundFieldIndexesInline(ctx, result); err != nil {
+		return err
 	}
 	if body.Updates.AlterLoadConfig != nil {
 		resp, err := c.mixCoord.UpdateLoadConfig(ctx, &querypb.UpdateLoadConfigRequest{
@@ -420,21 +460,18 @@ func (c *DDLCallback) alterCollectionV2AckCallback(ctx context.Context, result m
 			ResourceGroups: body.Updates.AlterLoadConfig.ResourceGroups,
 		})
 		if err != nil {
-			return errors.Wrap(err, "failed to update load config")
+			return merr.Wrap(err, "failed to update load config")
 		}
 		if err := merr.CheckRPCCall(resp, err); err != nil {
 			if errors.Is(err, merr.ErrResourceGroupNotFound) {
-				log.Ctx(ctx).Warn("failed to update load config due to missing resource group, stop retrying", zap.Error(err))
+				mlog.Warn(ctx, "failed to update load config due to missing resource group, stop retrying", mlog.Err(err))
 				return nil
 			}
-			return errors.Wrap(err, "failed to update load config")
+			return merr.Wrap(err, "failed to update load config")
 		}
 	}
 	if err := c.cascadeDropFieldIndexesInline(ctx, result); err != nil {
 		return err
-	}
-	if err := c.broker.BroadcastAlteredCollection(ctx, header.CollectionId); err != nil {
-		return errors.Wrap(err, "failed to broadcast altered collection")
 	}
 
 	// If the collection was renamed or moved to a different DB, grants were migrated
@@ -445,13 +482,61 @@ func (c *DDLCallback) alterCollectionV2AckCallback(ctx context.Context, result m
 			if err := c.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
 				OpType: int32(typeutil.CacheRefresh),
 			}); err != nil {
-				log.Ctx(ctx).Warn("failed to refresh RBAC policy cache after collection rename, skipping", zap.Error(err))
+				mlog.Warn(ctx, "failed to refresh RBAC policy cache after collection rename, skipping", mlog.Err(err))
 			}
 			break
 		}
 	}
 
 	return c.ExpireCaches(ctx, header)
+}
+
+// applyBoundFieldIndexesInline creates the index meta bound to a newly added
+// function-output field by inlining the CreateIndex ack callback, same pattern as
+// cascadeDropFieldIndexesInline. The FieldIndex was fully materialized (id/name
+// allocated, params validated) at DDL prepare time, so this is a pure idempotent
+// apply: a replayed callback rebuilds the identical synthetic message. Cannot use
+// the CreateIndex RPC here because it would deadlock on the resource key lock.
+// The synthetic message is never appended to the WAL; it only routes the apply
+// through the registry to datacoord's createIndexV2AckCallback.
+func (c *DDLCallback) applyBoundFieldIndexesInline(ctx context.Context, result message.BroadcastResultAlterCollectionMessageV2) error {
+	header := result.Message.Header()
+	boundFieldIndexes := result.Message.MustBody().GetUpdates().GetBoundFieldIndexes()
+	if len(boundFieldIndexes) == 0 {
+		return nil
+	}
+
+	controlChannelResult := result.GetControlChannelResult()
+	for _, fieldIndex := range boundFieldIndexes {
+		indexInfo := fieldIndex.GetIndexInfo()
+		mlog.Info(ctx, "applying bound field index of alter collection schema",
+			mlog.FieldMessage(result.Message),
+			mlog.FieldFieldID(indexInfo.GetFieldID()),
+			mlog.String("indexName", indexInfo.GetIndexName()),
+			mlog.FieldIndexID(indexInfo.GetIndexID()),
+		)
+		createIndexMsg := message.NewCreateIndexMessageBuilderV2().
+			WithHeader(&message.CreateIndexMessageHeader{
+				DbId:         header.DbId,
+				CollectionId: header.CollectionId,
+				FieldId:      indexInfo.GetFieldID(),
+				IndexId:      indexInfo.GetIndexID(),
+				IndexName:    indexInfo.GetIndexName(),
+			}).
+			WithBody(&message.CreateIndexMessageBody{
+				FieldIndex: fieldIndex,
+			}).
+			WithBroadcast([]string{streaming.WAL().ControlChannel()}).
+			MustBuildBroadcast().
+			WithBroadcastID(result.Message.BroadcastHeader().BroadcastID)
+
+		if err := registry.CallMessageAckCallback(ctx, createIndexMsg, map[string]*message.AppendResult{
+			streaming.WAL().ControlChannel(): controlChannelResult,
+		}); err != nil {
+			return merr.Wrap(err, "failed to apply bound field index")
+		}
+	}
+	return nil
 }
 
 // cascadeDropFieldIndexesInline drops indexes on dropped fields by inlining the
@@ -482,11 +567,11 @@ func (c *DDLCallback) cascadeDropFieldIndexesInline(ctx context.Context, result 
 	var indexIDs []int64
 	for _, indexInfo := range resp.GetIndexInfos() {
 		if _, ok := droppedFieldSet[indexInfo.GetFieldID()]; ok {
-			log.Ctx(ctx).Info("cascade dropping index on dropped field",
-				log.FieldMessage(result.Message),
-				zap.Int64("fieldID", indexInfo.GetFieldID()),
-				zap.String("indexName", indexInfo.GetIndexName()),
-				zap.Int64("indexID", indexInfo.GetIndexID()),
+			mlog.Info(ctx, "cascade dropping index on dropped field",
+				mlog.FieldMessage(result.Message),
+				mlog.FieldFieldID(indexInfo.GetFieldID()),
+				mlog.String("indexName", indexInfo.GetIndexName()),
+				mlog.FieldIndexID(indexInfo.GetIndexID()),
 			)
 			indexIDs = append(indexIDs, indexInfo.GetIndexID())
 		}

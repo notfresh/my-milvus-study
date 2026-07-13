@@ -90,6 +90,22 @@ func TestDDLCallbacksAlterCollectionProperties(t *testing.T) {
 	})
 	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
 
+	// namespace.sharding.enabled is immutable after collection creation.
+	resp, err = core.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		Properties:     []*commonpb.KeyValuePair{{Key: common.NamespaceShardingEnabledKey, Value: "true"}},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
+
+	// namespace.sharding.enabled cannot be deleted after collection creation.
+	resp, err = core.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		DeleteKeys:     []string{common.NamespaceShardingEnabledKey},
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
+
 	// Alter a database that does not exist should return error.
 	resp, err = core.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
 		DbName:         dbName,
@@ -113,6 +129,34 @@ func TestDDLCallbacksAlterCollectionProperties(t *testing.T) {
 	// atler a property of a collection.
 	createCollectionAndAliasForTest(t, ctx, core, dbName, collectionName)
 	assertReplicaNumber(t, ctx, core, dbName, collectionName, 1)
+
+	for _, tc := range []struct {
+		name       string
+		properties []*commonpb.KeyValuePair
+		deleteKeys []string
+	}{
+		{
+			name:       "set namespace mode",
+			properties: []*commonpb.KeyValuePair{{Key: common.NamespaceModeKey, Value: common.NamespaceModePartition}},
+		},
+		{
+			name:       "delete namespace mode",
+			deleteKeys: []string{common.NamespaceModeKey},
+		},
+	} {
+		t.Run("reject "+tc.name, func(t *testing.T) {
+			resp, err = core.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
+				DbName:         dbName,
+				CollectionName: collectionName,
+				Properties:     tc.properties,
+				DeleteKeys:     tc.deleteKeys,
+			})
+			alterErr := merr.CheckRPCCall(resp, err)
+			require.ErrorIs(t, alterErr, merr.ErrParameterInvalid)
+			require.ErrorContains(t, alterErr, common.NamespaceModeKey)
+		})
+	}
+
 	resp, err = core.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
 		DbName:         dbName,
 		CollectionName: collectionName,
@@ -171,6 +215,46 @@ func TestDDLCallbacksAlterCollectionProperties(t *testing.T) {
 	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrParameterInvalid)
 }
 
+func TestValidateNamespaceModeImmutable(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		properties []*commonpb.KeyValuePair
+		deleteKeys []string
+	}{
+		{
+			name:       "set namespace mode",
+			properties: []*commonpb.KeyValuePair{{Key: common.NamespaceModeKey, Value: common.NamespaceModePartition}},
+		},
+		{
+			name:       "set namespace mode with wrong case",
+			properties: []*commonpb.KeyValuePair{{Key: "Namespace.Mode", Value: common.NamespaceModePartition}},
+		},
+		{
+			name:       "delete namespace mode",
+			deleteKeys: []string{common.NamespaceModeKey},
+		},
+		{
+			name:       "delete namespace mode with wrong case",
+			deleteKeys: []string{"Namespace.Mode"},
+		},
+	} {
+		t.Run("reject "+tc.name, func(t *testing.T) {
+			err := validateNamespaceModeImmutable(tc.properties, tc.deleteKeys)
+			require.ErrorIs(t, err, merr.ErrParameterInvalid)
+			require.ErrorContains(t, err, common.NamespaceModeKey)
+		})
+	}
+
+	require.NoError(t, validateNamespaceModeImmutable(
+		[]*commonpb.KeyValuePair{{Key: common.CollectionReplicaNumber, Value: "2"}},
+		nil,
+	))
+	require.NoError(t, validateNamespaceModeImmutable(
+		nil,
+		[]string{common.CollectionReplicaNumber},
+	))
+}
+
 func TestDDLCallbacksAlterCollectionV2AckCallback_UpdateLoadConfigRPCError(t *testing.T) {
 	ctx := context.Background()
 
@@ -184,7 +268,11 @@ func TestDDLCallbacksAlterCollectionV2AckCallback_UpdateLoadConfigRPCError(t *te
 		withMeta(meta),
 		withMixCoord(mixc),
 		withValidProxyManager(),
-		withBroker(&mockBroker{}),
+		withBroker(&mockBroker{
+			BroadcastAlteredCollectionFunc: func(ctx context.Context, collectionID int64) error {
+				return nil
+			},
+		}),
 	)
 	cb := &DDLCallback{Core: c}
 
@@ -224,7 +312,11 @@ func TestDDLCallbacksAlterCollectionV2AckCallback_UpdateLoadConfigNonRGNotFoundE
 		withMeta(meta),
 		withMixCoord(mixc),
 		withValidProxyManager(),
-		withBroker(&mockBroker{}),
+		withBroker(&mockBroker{
+			BroadcastAlteredCollectionFunc: func(ctx context.Context, collectionID int64) error {
+				return nil
+			},
+		}),
 	)
 	cb := &DDLCallback{Core: c}
 
@@ -268,7 +360,11 @@ func TestDDLCallbacksAlterCollectionV2AckCallback_StopRetryOnResourceGroupNotFou
 		withMeta(meta),
 		withMixCoord(mixc),
 		withValidProxyManager(),
-		withBroker(&mockBroker{}),
+		withBroker(&mockBroker{
+			BroadcastAlteredCollectionFunc: func(ctx context.Context, collectionID int64) error {
+				return nil
+			},
+		}),
 	)
 	cb := &DDLCallback{Core: c}
 
@@ -351,8 +447,9 @@ func TestDDLCallbacksAlterCollectionV2AckCallback_BroadcastAlteredCollectionErro
 	meta := mockrootcoord.NewIMetaTable(t)
 	meta.EXPECT().AlterCollection(mock.Anything, mock.Anything).Return(nil)
 
+	// UpdateLoadConfig is never reached: the schema broadcast now runs first
+	// (before the bound-index apply and load-config update) and fails here.
 	mixc := imocks.NewMixCoord(t)
-	mixc.On("UpdateLoadConfig", mock.Anything, mock.Anything).Return(merr.Success(), nil)
 
 	c := newTestCore(
 		withMeta(meta),
@@ -647,10 +744,10 @@ func TestDDLCallbacksAlterCollectionProperties_AcceptExternalSourceSpec(t *testi
 	testSchema := &schemapb.CollectionSchema{
 		Name: collectionName,
 		Fields: []*schemapb.FieldSchema{
-			{Name: "field1", DataType: schemapb.DataType_Int64},
+			{Name: "field1", DataType: schemapb.DataType_Int64, ExternalField: "field1"},
 		},
 		ExternalSource: "s3://bucket/old/",
-		ExternalSpec:   `{"format":"parquet"}`,
+		ExternalSpec:   `{"format":"parquet","extfs":{"anonymous":"true","region":"us-east-1","cloud_provider":"aws"}}`,
 	}
 	schemaBytes, err := proto.Marshal(testSchema)
 	require.NoError(t, err)
@@ -667,12 +764,12 @@ func TestDDLCallbacksAlterCollectionProperties_AcceptExternalSourceSpec(t *testi
 		DbName: dbName, CollectionName: collectionName,
 		Properties: []*commonpb.KeyValuePair{
 			{Key: common.CollectionExternalSource, Value: "s3://bucket/new/"},
-			{Key: common.CollectionExternalSpec, Value: `{"format":"parquet"}`},
+			{Key: common.CollectionExternalSpec, Value: `{"format":"parquet","extfs":{"anonymous":"true","region":"us-east-1","cloud_provider":"aws"}}`},
 		},
 	})
 	require.NoError(t, merr.CheckRPCCall(resp, err))
 	assertExternalSource(t, ctx, core, dbName, collectionName, "s3://bucket/new/")
-	assertExternalSpec(t, ctx, core, dbName, collectionName, `{"format":"parquet"}`)
+	assertExternalSpec(t, ctx, core, dbName, collectionName, `{"format":"parquet","extfs":{"anonymous":"true","region":"us-east-1","cloud_provider":"aws"}}`)
 }
 
 // Regression for #49335: refresh override path may carry source-only updates
@@ -691,10 +788,10 @@ func TestDDLCallbacksAlterCollectionProperties_PartialExternalUpdatePreservesOth
 	testSchema := &schemapb.CollectionSchema{
 		Name: collectionName,
 		Fields: []*schemapb.FieldSchema{
-			{Name: "field1", DataType: schemapb.DataType_Int64},
+			{Name: "field1", DataType: schemapb.DataType_Int64, ExternalField: "field1"},
 		},
 		ExternalSource: "s3://bucket/old/",
-		ExternalSpec:   `{"format":"parquet","extfs":{"region":"us-east-1"}}`,
+		ExternalSpec:   `{"format":"parquet","extfs":{"anonymous":"true","region":"us-east-1","cloud_provider":"aws"}}`,
 	}
 	schemaBytes, err := proto.Marshal(testSchema)
 	require.NoError(t, err)
@@ -715,7 +812,7 @@ func TestDDLCallbacksAlterCollectionProperties_PartialExternalUpdatePreservesOth
 	})
 	require.NoError(t, merr.CheckRPCCall(resp, err))
 	assertExternalSource(t, ctx, core, dbName, collectionName, "s3://bucket/new/")
-	assertExternalSpec(t, ctx, core, dbName, collectionName, `{"format":"parquet","extfs":{"region":"us-east-1"}}`)
+	assertExternalSpec(t, ctx, core, dbName, collectionName, `{"format":"parquet","extfs":{"anonymous":"true","region":"us-east-1","cloud_provider":"aws"}}`)
 }
 
 // Regression for #49335: alter that mixes external_source with a regular
@@ -734,10 +831,10 @@ func TestDDLCallbacksAlterCollectionProperties_MixedExternalAndRegular(t *testin
 	testSchema := &schemapb.CollectionSchema{
 		Name: collectionName,
 		Fields: []*schemapb.FieldSchema{
-			{Name: "field1", DataType: schemapb.DataType_Int64},
+			{Name: "field1", DataType: schemapb.DataType_Int64, ExternalField: "field1"},
 		},
 		ExternalSource: "s3://bucket/old/",
-		ExternalSpec:   `{"format":"parquet"}`,
+		ExternalSpec:   `{"format":"parquet","extfs":{"anonymous":"true","region":"us-east-1","cloud_provider":"aws"}}`,
 	}
 	schemaBytes, err := proto.Marshal(testSchema)
 	require.NoError(t, err)
