@@ -28,6 +28,8 @@
 
 - [依赖全景](dependency-landscape.md) — Go / C++ / Rust / Python 全部依赖配置
   文件清单和改动指南。`topic: build`，`status: stable`
+- [Makefile 实时进度日志](make-realtime-progress.md) — `Makefile` 第 24–134 行的
+  构建进度记录机制解析。`topic: build`，`status: stable`
 
 ## 子系统速览
 

@@ -1,0 +1,1 @@
+make -n MILVUS_PROGRESS_DRYRUN_LOG=1 milvus
