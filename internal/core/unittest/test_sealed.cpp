@@ -3765,6 +3765,56 @@ TEST(SealedSegmentReopen, SchemaOnlyReopenPublishesDefaultFilledState) {
     EXPECT_TRUE(snapshot->IsFieldFilledWithDefault(FieldId(101)));
 }
 
+TEST(SealedSegmentLoad, LoadPublishesDefaultFilledStateAfterCompact) {
+    auto schema = std::make_shared<Schema>();
+    auto pk_id = schema->AddDebugField("pk", DataType::INT64);
+    auto new_field = schema->AddDebugField("new_field", DataType::INT64);
+    schema->set_primary_field_id(pk_id);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    const size_t N = 1;
+    std::vector<int64_t> pks = {1};
+    auto pk_field_data =
+        storage::CreateFieldData(DataType::INT64, DataType::NONE, false, 1, N);
+    pk_field_data->FillFieldData(pks.data(), N);
+    auto cm = milvus::storage::RemoteChunkManagerSingleton::GetInstance()
+                  .GetRemoteChunkManager();
+    auto pk_load_info = PrepareSingleFieldInsertBinlog(kCollectionID,
+                                                       kPartitionID,
+                                                       kSegmentID,
+                                                       pk_id.get(),
+                                                       {pk_field_data},
+                                                       cm);
+
+    proto::segcore::SegmentLoadInfo proto;
+    proto.set_segmentid(kSegmentID);
+    proto.set_partitionid(kPartitionID);
+    proto.set_collectionid(kCollectionID);
+    proto.set_num_of_rows(N);
+    for (const auto& [field_id, field_info] : pk_load_info.field_infos) {
+        auto* binlog = proto.add_binlog_paths();
+        binlog->set_fieldid(field_id);
+        for (int i = 0; i < field_info.insert_files.size(); ++i) {
+            auto* log = binlog->add_binlogs();
+            log->set_log_path(field_info.insert_files[i]);
+            log->set_entries_num(field_info.entries_nums[i]);
+            log->set_log_size(field_info.memory_sizes[i]);
+        }
+    }
+
+    sealed->SetLoadInfo(proto);
+
+    milvus::tracer::TraceContext trace_ctx;
+    milvus::OpContext op_ctx;
+    ASSERT_NO_THROW(sealed->Load(trace_ctx, &op_ctx));
+    EXPECT_TRUE(sealed->HasFieldData(new_field));
+    EXPECT_TRUE(
+        sealed->TestGetSegmentLoadInfo()->IsFieldFilledWithDefault(new_field));
+}
+
 TEST(SealedSegmentReopen, SchemaAwareReopenDiscardsOlderSchema) {
     auto old_schema = std::make_shared<Schema>();
     auto pk_id = old_schema->AddDebugField("pk", DataType::INT64);
@@ -4650,6 +4700,278 @@ TEST(SealedSegmentCowState, ClearPublishedStateDropsRuntimeSnapshot) {
     ASSERT_NE(after, nullptr);
     EXPECT_EQ(after->runtime, nullptr);
     EXPECT_FALSE(GetFieldBit(after->field_data_ready_bitset, payload));
+}
+
+TEST(SealedSegmentCowState, JsonIndexStagesAndFollowsSnapshotLifetime) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto json = schema->AddDebugField("payload", DataType::JSON);
+    schema->set_primary_field_id(pk);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    std::array<int64_t, 4> values = {1, 2, 3, 4};
+    auto indexing = GenScalarIndexing<int64_t>(values.size(), values.data());
+    LoadIndexInfo load_info;
+    load_info.field_id = json.get();
+    load_info.field_type = DataType::JSON;
+    load_info.index_params = {
+        {index::INDEX_TYPE, index::INVERTED_INDEX_TYPE},
+        {JSON_PATH, "a"},
+        {JSON_CAST_TYPE, "DOUBLE"},
+    };
+    load_info.cache_index =
+        CreateTestCacheIndex("json-runtime", std::move(indexing));
+    auto loaded_index = load_info.cache_index;
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_TRUE(current->runtime->json_indices.empty());
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    ChunkedSegmentSealedImpl::StateDelta initial_delta;
+    initial_delta.schema = current->schema;
+    initial_delta.load_info = current->load_info;
+    initial_delta.runtime = sealed->TestFreezeRuntimeResourceState(runtime);
+    initial_delta.commit_ts = current->commit_ts;
+    auto staged = sealed->TestBuildNextPublishedState(current, initial_delta);
+
+    ChunkedSegmentSealedImpl::StateDelta final_delta;
+    final_delta.schema = current->schema;
+    final_delta.load_info = current->load_info;
+    final_delta.commit_ts = current->commit_ts;
+    sealed->TestStageLoadIndexThenPublish(
+        load_info,
+        false,
+        schema,
+        runtime,
+        staged.get(),
+        current,
+        final_delta,
+        [&] {
+            EXPECT_EQ(runtime->json_indices.size(), 1);
+            EXPECT_TRUE(current->runtime->json_indices.empty());
+            EXPECT_FALSE(sealed->HasJsonIndex(json));
+        });
+
+    auto published = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(published->runtime->json_indices.size(), 1);
+    EXPECT_EQ(published->runtime->json_indices.front().index, loaded_index);
+    EXPECT_TRUE(sealed->HasJsonIndex(json));
+
+    sealed->DropJSONIndex(json, "a");
+    auto after_drop = sealed->TestGetPublishedStateSnapshot();
+    EXPECT_TRUE(after_drop->runtime->json_indices.empty());
+    EXPECT_FALSE(sealed->HasJsonIndex(json));
+
+    ASSERT_EQ(published->runtime->json_indices.size(), 1);
+    EXPECT_EQ(published->runtime->json_indices.front().index, loaded_index);
+}
+
+TEST(SealedSegmentCowState, JsonIndexReplaceScalarWithNgramErasesScalarPath) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto json = schema->AddDebugField("payload", DataType::JSON);
+    schema->set_primary_field_id(pk);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    std::array<int64_t, 4> values = {1, 2, 3, 4};
+    auto make_load_info = [&](std::string key,
+                              std::string path,
+                              bool is_ngram) {
+        LoadIndexInfo info;
+        info.field_id = json.get();
+        info.field_type = DataType::JSON;
+        info.index_params = {
+            {index::INDEX_TYPE,
+             is_ngram ? index::NGRAM_INDEX_TYPE : index::INVERTED_INDEX_TYPE},
+            {JSON_PATH, std::move(path)},
+        };
+        if (!is_ngram) {
+            info.index_params[JSON_CAST_TYPE] = "DOUBLE";
+        }
+        auto indexing =
+            GenScalarIndexing<int64_t>(values.size(), values.data());
+        info.cache_index =
+            CreateTestCacheIndex(std::move(key), std::move(indexing));
+        return info;
+    };
+
+    auto sibling = make_load_info("json-scalar-b", "b", false);
+    auto sibling_index = sibling.cache_index;
+    sealed->LoadIndex(sibling);
+
+    auto original = make_load_info("json-scalar-a", "a", false);
+    auto original_index = original.cache_index;
+    sealed->LoadIndex(original);
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(current->runtime->json_indices.size(), 2);
+    EXPECT_TRUE(current->runtime->ngram_indexings.empty());
+    EXPECT_FALSE(GetFieldBit(current->index_ready_bitset, json));
+
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    ChunkedSegmentSealedImpl::StateDelta initial_delta;
+    initial_delta.schema = current->schema;
+    initial_delta.load_info = current->load_info;
+    initial_delta.runtime = sealed->TestFreezeRuntimeResourceState(runtime);
+    initial_delta.commit_ts = current->commit_ts;
+    auto staged = sealed->TestBuildNextPublishedState(current, initial_delta);
+
+    auto replacement = make_load_info("json-ngram-a", "a", true);
+    auto replacement_index = replacement.cache_index;
+    ChunkedSegmentSealedImpl::StateDelta final_delta;
+    final_delta.schema = current->schema;
+    final_delta.load_info = current->load_info;
+    final_delta.commit_ts = current->commit_ts;
+    sealed->TestStageLoadIndexThenPublish(
+        replacement,
+        true,
+        schema,
+        runtime,
+        staged.get(),
+        current,
+        final_delta,
+        [&] {
+            ASSERT_EQ(runtime->json_indices.size(), 1);
+            EXPECT_EQ(runtime->json_indices.front().nested_path, "b");
+            EXPECT_EQ(runtime->json_indices.front().index, sibling_index);
+            ASSERT_EQ(runtime->ngram_indexings.count(json), 1);
+            ASSERT_EQ(runtime->ngram_indexings.at(json).count("a"), 1);
+            EXPECT_EQ(runtime->ngram_indexings.at(json).at("a"),
+                      replacement_index);
+            EXPECT_TRUE(GetFieldBit(staged->index_ready_bitset, json));
+
+            ASSERT_EQ(current->runtime->json_indices.size(), 2);
+            EXPECT_TRUE(current->runtime->ngram_indexings.empty());
+        });
+
+    auto published = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(published->runtime->json_indices.size(), 1);
+    EXPECT_EQ(published->runtime->json_indices.front().nested_path, "b");
+    EXPECT_EQ(published->runtime->json_indices.front().index, sibling_index);
+    ASSERT_EQ(published->runtime->ngram_indexings.count(json), 1);
+    EXPECT_EQ(published->runtime->ngram_indexings.at(json).at("a"),
+              replacement_index);
+    EXPECT_TRUE(GetFieldBit(published->index_ready_bitset, json));
+
+    ASSERT_EQ(current->runtime->json_indices.size(), 2);
+    auto old_path = std::find_if(
+        current->runtime->json_indices.begin(),
+        current->runtime->json_indices.end(),
+        [](const auto& index) { return index.nested_path == "a"; });
+    ASSERT_NE(old_path, current->runtime->json_indices.end());
+    EXPECT_EQ(old_path->index, original_index);
+}
+
+TEST(SealedSegmentCowState, JsonIndexReplaceNgramWithScalarErasesNgramPath) {
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    auto json = schema->AddDebugField("payload", DataType::JSON);
+    schema->set_primary_field_id(pk);
+
+    auto segment = CreateSealedSegment(schema);
+    auto* sealed = dynamic_cast<ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(sealed, nullptr);
+
+    std::array<int64_t, 4> values = {1, 2, 3, 4};
+    auto make_load_info = [&](std::string key,
+                              std::string path,
+                              bool is_ngram) {
+        LoadIndexInfo info;
+        info.field_id = json.get();
+        info.field_type = DataType::JSON;
+        info.index_params = {
+            {index::INDEX_TYPE,
+             is_ngram ? index::NGRAM_INDEX_TYPE : index::INVERTED_INDEX_TYPE},
+            {JSON_PATH, std::move(path)},
+        };
+        if (!is_ngram) {
+            info.index_params[JSON_CAST_TYPE] = "DOUBLE";
+        }
+        auto indexing =
+            GenScalarIndexing<int64_t>(values.size(), values.data());
+        info.cache_index =
+            CreateTestCacheIndex(std::move(key), std::move(indexing));
+        return info;
+    };
+
+    auto sibling = make_load_info("json-scalar-b", "b", false);
+    auto sibling_index = sibling.cache_index;
+    sealed->LoadIndex(sibling);
+
+    auto original = make_load_info("json-ngram-a", "a", true);
+    auto original_index = original.cache_index;
+    sealed->LoadIndex(original);
+
+    auto current = sealed->TestGetPublishedStateSnapshot();
+    ASSERT_EQ(current->runtime->json_indices.size(), 1);
+    ASSERT_EQ(current->runtime->ngram_indexings.count(json), 1);
+    EXPECT_EQ(current->runtime->ngram_indexings.at(json).at("a"),
+              original_index);
+    EXPECT_TRUE(GetFieldBit(current->index_ready_bitset, json));
+
+    auto runtime = sealed->TestCloneMutableRuntimeResourceState();
+    ChunkedSegmentSealedImpl::StateDelta initial_delta;
+    initial_delta.schema = current->schema;
+    initial_delta.load_info = current->load_info;
+    initial_delta.runtime = sealed->TestFreezeRuntimeResourceState(runtime);
+    initial_delta.commit_ts = current->commit_ts;
+    auto staged = sealed->TestBuildNextPublishedState(current, initial_delta);
+
+    auto replacement = make_load_info("json-scalar-a", "a", false);
+    auto replacement_index = replacement.cache_index;
+    ChunkedSegmentSealedImpl::StateDelta final_delta;
+    final_delta.schema = current->schema;
+    final_delta.load_info = current->load_info;
+    final_delta.commit_ts = current->commit_ts;
+    sealed->TestStageLoadIndexThenPublish(
+        replacement,
+        true,
+        schema,
+        runtime,
+        staged.get(),
+        current,
+        final_delta,
+        [&] {
+            EXPECT_TRUE(runtime->ngram_indexings.empty());
+            ASSERT_EQ(runtime->json_indices.size(), 2);
+            auto replacement_path = std::find_if(
+                runtime->json_indices.begin(),
+                runtime->json_indices.end(),
+                [](const auto& index) { return index.nested_path == "a"; });
+            ASSERT_NE(replacement_path, runtime->json_indices.end());
+            EXPECT_EQ(replacement_path->index, replacement_index);
+            EXPECT_FALSE(GetFieldBit(staged->index_ready_bitset, json));
+
+            ASSERT_EQ(current->runtime->ngram_indexings.count(json), 1);
+            EXPECT_EQ(current->runtime->ngram_indexings.at(json).at("a"),
+                      original_index);
+        });
+
+    auto published = sealed->TestGetPublishedStateSnapshot();
+    EXPECT_TRUE(published->runtime->ngram_indexings.empty());
+    ASSERT_EQ(published->runtime->json_indices.size(), 2);
+    auto sibling_path = std::find_if(
+        published->runtime->json_indices.begin(),
+        published->runtime->json_indices.end(),
+        [](const auto& index) { return index.nested_path == "b"; });
+    ASSERT_NE(sibling_path, published->runtime->json_indices.end());
+    EXPECT_EQ(sibling_path->index, sibling_index);
+    auto replacement_path = std::find_if(
+        published->runtime->json_indices.begin(),
+        published->runtime->json_indices.end(),
+        [](const auto& index) { return index.nested_path == "a"; });
+    ASSERT_NE(replacement_path, published->runtime->json_indices.end());
+    EXPECT_EQ(replacement_path->index, replacement_index);
+    EXPECT_FALSE(GetFieldBit(published->index_ready_bitset, json));
+
+    ASSERT_EQ(current->runtime->ngram_indexings.count(json), 1);
+    EXPECT_EQ(current->runtime->ngram_indexings.at(json).at("a"),
+              original_index);
 }
 
 TEST(SealedSegmentCowState, JsonStatsLivesInRuntimeSnapshot) {
