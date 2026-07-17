@@ -17,6 +17,8 @@
 # limitations under the License.
 
 run_embed() {
+
+
     cat << EOF > embedEtcd.yaml
 listen-client-urls: http://0.0.0.0:2379
 advertise-client-urls: http://0.0.0.0:2379
@@ -39,6 +41,10 @@ EOF
         echo "user.yaml file does not exist. Please try to create it in the current directory."
         exit 1
     fi
+    echo "create data directory: mkdir -p ./volumes/milvus"
+    mkdir -p ./volumes/milvus
+    echo "update permissions: chmod -R 777 ./volumes/milvus"
+    chmod 777  -R ./volumes/milvus
     
     sudo docker run -d \
         --name milvus-standalone \
@@ -89,8 +95,10 @@ start() {
     res=`sudo docker ps -a|grep milvus-standalone|wc -l`
     if [ $res -eq 1 ]
     then
+        echo "start milvus standalone"
         sudo docker start milvus-standalone 1> /dev/null
     else
+        echo "run embed"
         run_embed
     fi
 
